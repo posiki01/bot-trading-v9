@@ -1,0 +1,117 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+.venv.bak/
+
+# Logs
+logs/
+*.log
+*.log.*
+*.log.*
+
+# Data
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+
+# Backups
+*.backup
+*.bak
+*.tmp
+*.temp
+
+# Reportes
+reportes/
+*.json
+*.csv
+*.png
+*.html
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Entorno
+.env
+.env.local
+.env.*.local
+*.env
+
+# Cache
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Backtest
+backtest_results/
+*.pkl
+*.pickle
+
+# ML
+ml_weights.json
+ml_metrics_history.json
+ml_weights_history.json
+ml_metadata.json
+latency_stats.json
+
+# Notificaciones
+*.db.backup
+*.json.migrated
+
+# Ocultos
+*.pyc
+*.pyo
+*.pyd
+
+# Test
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Distribución
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Instalación
+pip-log.txt
+pip-delete-this-directory.txt
