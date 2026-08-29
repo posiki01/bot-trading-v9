@@ -5,8 +5,8 @@ Surrogate Trading - Aprende de todas las velas históricas.
 """
 
 import logging
-import pandas as pd
 import numpy as np
+import pandas as pd
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger('BotTrading.ML.Surrogate')
@@ -15,7 +15,7 @@ logger = logging.getLogger('BotTrading.ML.Surrogate')
 class SurrogateTrader:
     """
     Genera simulaciones de trading para entrenamiento del modelo.
-    V9.0 - INDEPENDIENTE.
+    V9.0 - COMPLETO.
     """
     
     def __init__(self,

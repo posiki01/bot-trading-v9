@@ -277,6 +277,7 @@ class TrailingEngine:
                                modo: str = 'RETEST') -> DecisionTrailing:
         """
         Calcula si se debe mover el SL y a dónde.
+        V9.2 - CORREGIDO: Normaliza dirección y usa precio actualizado.
         
         Args:
             pos: Datos de la posición
@@ -290,8 +291,8 @@ class TrailingEngine:
             DecisionTrailing
         """
         simbolo = pos.get('simbolo', '')
-        direccion = pos.get('direccion', 'COMPRA')
-        entry_price = pos.get('entrada', 0)
+        direccion = self._normalizar_direccion(pos.get('direccion', pos.get('tipo', 'COMPRA')))
+        entry_price = pos.get('entrada', pos.get('precio_apertura', 0))
         sl_actual = pos.get('sl', 0)
         
         # Validar datos
@@ -376,6 +377,27 @@ class TrailingEngine:
         self._log_decision(simbolo, ganancia_pips, decision)
         
         return decision
+    
+    # ============================================================
+    # ✅ CORRECCIÓN V9.2: Normalizar dirección
+    # ============================================================
+    
+    def _normalizar_direccion(self, direccion: str) -> str:
+        """
+        Normaliza la dirección a formato interno.
+        V9.2 - CORREGIDO: Acepta BUY/SELL y COMPRA/VENTA.
+        """
+        if direccion is None:
+            return 'COMPRA'
+        
+        direccion = direccion.upper().strip()
+        
+        if direccion in ['BUY', 'LONG', 'COMPRA', 'B']:
+            return 'COMPRA'
+        if direccion in ['SELL', 'SHORT', 'VENTA', 'S']:
+            return 'VENTA'
+        
+        return 'COMPRA'
     
     # ============================================================
     # DECISIÓN DE TRAILING
@@ -704,46 +726,29 @@ class TrailingEngine:
     # ============================================================
     
     def _obtener_pip_val(self, simbolo: str, precio: float) -> float:
-        """
-        Obtiene el valor de un pip para el símbolo.
-        
-        Args:
-            simbolo: Símbolo
-            precio: Precio de referencia
-        
-        Returns:
-            Valor del pip
-        """
         simbolo_upper = simbolo.upper()
-        
         if 'JPY' in simbolo_upper:
             return 0.01
-        if any(x in simbolo_upper for x in ['XAU', 'XAG']):
-            return 0.10
+        if 'XAU' in simbolo_upper:
+            return 0.01  # ✅ CORREGIDO: Oro usa point = 0.01
+        if 'XAG' in simbolo_upper:
+            return 0.01  # ✅ CORREGIDO: Plata usa point = 0.001 (pip = 0.01)
         if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
             return 1.0
         if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
             return 1.0
         return 0.0001
-    
+
     def _obtener_digits(self, simbolo: str) -> int:
-        """
-        Obtiene el número de dígitos del símbolo.
-        
-        Args:
-            simbolo: Símbolo
-        
-        Returns:
-            Número de dígitos
-        """
         simbolo_upper = simbolo.upper()
-        
         if 'JPY' in simbolo_upper:
             return 3
-        if any(x in simbolo_upper for x in ['XAU', 'XAG']):
+        if 'XAU' in simbolo_upper:
             return 2
+        if 'XAG' in simbolo_upper:
+            return 3  # ✅ CORRECTO: Plata usa 3 dígitos
         if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
-            return 2
+            return 1  # ✅ CORRECTO: Índices usan 1 dígito
         if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
             return 2
         return 5

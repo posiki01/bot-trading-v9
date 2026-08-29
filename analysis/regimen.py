@@ -184,19 +184,9 @@ class MarketRegimeFilter:
     # ============================================================
     
     def clasificar(self, simbolo: str, df_h4: pd.DataFrame, 
-                   df_h1: pd.DataFrame, force: bool = False) -> RegimenData:
-        """
-        Clasifica el régimen de mercado.
+               df_h1: pd.DataFrame, force: bool = False) -> RegimenData:
+        """Clasifica el régimen de mercado con fallback."""
         
-        Args:
-            simbolo: Símbolo
-            df_h4: DataFrame H4
-            df_h1: DataFrame H1
-            force: Forzar recálculo
-        
-        Returns:
-            RegimenData
-        """
         # Verificar caché
         cache_key = f"{simbolo}_{id(df_h1)}_{id(df_h4)}"
         if not force and cache_key in self._cache:
@@ -204,13 +194,26 @@ class MarketRegimeFilter:
             if time.time() - timestamp < self._cache_ttl:
                 return data
         
-        # 1. Calcular indicadores
-        indicadores = self.indicadores.calcular_todos_indicadores(df_h4, df_h1)
+        # 1. Calcular indicadores CON FALLBACK
+        indicadores = self.indicadores.calcular_todos_indicadores_con_fallback(df_h4, df_h1)
         
-        if not indicadores:
-            logger.warning(f"⚠️ No se pudieron calcular indicadores para {simbolo}")
-            return self._crear_regimen_incierto(0)
-        
+        if not indicadores or len(indicadores) < 3:
+            logger.warning(f"⚠️ {simbolo}: Sin indicadores, usando fallback por EMAs")
+            
+            if df_h1 is not None and len(df_h1) >= 50:
+                close = df_h1['Close']
+                ema20 = close.ewm(span=20, adjust=False).mean().iloc[-1]
+                ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
+                
+                if ema20 > ema50 * 1.01:
+                    return self._crear_regimen_desde_nombre('TREND_ALCISTA_DEBIL', 50, {})
+                elif ema20 < ema50 * 0.99:
+                    return self._crear_regimen_desde_nombre('TREND_BAJISTA_DEBIL', 50, {})
+                else:
+                    return self._crear_regimen_desde_nombre('RANGO_AMPLIO', 40, {})
+            
+            return self._crear_regimen_incierto(30)
+            
         # 2. Votación
         regimen, confianza, votos, confianzas, ponderados = self._votar(indicadores)
         
@@ -248,6 +251,34 @@ class MarketRegimeFilter:
             logger.debug(f"📊 {simbolo}: {resultado.regimen.value} (conf: {resultado.confianza:.1f}%)")
         
         return resultado
+
+    def _crear_regimen_desde_nombre(self, nombre: str, confianza: float, indicadores: Dict) -> RegimenData:
+        """Crea RegimenData desde un nombre de régimen."""
+        regimen_map = {
+            'TREND_ALCISTA_FUERTE': RegimenMercado.TREND_ALCISTA_FUERTE,
+            'TREND_BAJISTA_FUERTE': RegimenMercado.TREND_BAJISTA_FUERTE,
+            'TREND_ALCISTA_DEBIL': RegimenMercado.TREND_ALCISTA_DEBIL,
+            'TREND_BAJISTA_DEBIL': RegimenMercado.TREND_BAJISTA_DEBIL,
+            'RANGO_AMPLIO': RegimenMercado.RANGO_AMPLIO,
+            'RANGO_APRETADO': RegimenMercado.RANGO_APRETADO,
+            'CHOP_VOLATIL': RegimenMercado.CHOP_VOLATIL,
+            'BREAKOUT_INMINENTE': RegimenMercado.BREAKOUT_INMINENTE,
+            'INCERTO': RegimenMercado.INCERTO,
+        }
+        
+        return RegimenData(
+            regimen=regimen_map.get(nombre, RegimenMercado.INCERTO),
+            confianza=confianza,
+            adx_h4=indicadores.get('adx_h4', 0),
+            adx_h1=indicadores.get('adx_h1', 0),
+            er_kaufman=indicadores.get('er_kaufman', 0),
+            bb_width_pct=indicadores.get('bb_width', 50),
+            atr_pct=indicadores.get('atr_pct', 0.5),
+            estructura_swings=indicadores.get('estructura', 'DESCONOCIDO'),
+            direccion_favor='ALCISTA' if 'ALCISTA' in nombre else 'BAJISTA' if 'BAJISTA' in nombre else 'NONE',
+            metadata={'fallback': True}
+        )
+
     
     # ============================================================
     # SISTEMA DE VOTACIÓN

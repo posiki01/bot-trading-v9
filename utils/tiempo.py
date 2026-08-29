@@ -221,41 +221,7 @@ class HorarioMercado:
     # VALIDACIÓN DE MERCADO GLOBAL
     # ============================================================
     
-    def mercado_abierto(self, ahora: Optional[datetime] = None) -> bool:
-        """
-        Determina si el mercado tradicional está abierto.
         
-        Args:
-            ahora: Fecha de referencia
-        
-        Returns:
-            True si el mercado está abierto
-        """
-        if ahora is None:
-            ahora = self.ahora_utc()
-        
-        hora_col = ahora.astimezone(self.ZONAS['COLOMBIA'])
-        weekday_col = hora_col.weekday()
-        hora_col_float = hora_col.hour + hora_col.minute / 60.0
-        
-        # Sábado → cerrado
-        if weekday_col == 5:
-            return False
-        
-        # Domingo → cerrado hasta 17:00 COT
-        if weekday_col == 6 and hora_col_float < 17.0:
-            return False
-        
-        # Viernes → cerrado después de 17:00 COT (cierre general)
-        if weekday_col == 4 and hora_col_float >= 17.0:
-            return False
-        
-        # Lunes → abierto después de 02:00 COT
-        if weekday_col == 0 and hora_col_float < 2.0:
-            return False
-        
-        return True
-    
     def estado_mercado(self, ahora: Optional[datetime] = None) -> EstadoMercado:
         """
         Obtiene el estado detallado del mercado global.
@@ -272,10 +238,9 @@ class HorarioMercado:
         if self.es_horario_rollover(ahora):
             return EstadoMercado.ROLLOVER
         
-        if self.es_fin_de_semana_cerrado(ahora):
-            return EstadoMercado.FIN_SEMANA
-        
         if not self.mercado_abierto(ahora):
+            if self.es_fin_de_semana_cerrado(ahora):
+                return EstadoMercado.FIN_SEMANA
             return EstadoMercado.CERRADO
         
         return EstadoMercado.ABIERTO
@@ -351,9 +316,9 @@ class HorarioMercado:
             # Si no hay símbolo, usar cierre más temprano
             return hora_col_float >= 16.0
         
-        # Lunes → cerrado hasta 02:00 COT
-        if weekday_col == 0 and hora_col_float < 2.0:
-            return True
+        # ✅ Lunes → NO es fin de semana
+        if weekday_col == 0:
+            return False
         
         return False
     
@@ -361,124 +326,288 @@ class HorarioMercado:
     # VALIDACIÓN POR SÍMBOLO
     # ============================================================
     
-    def es_horario_operativo(self,
-                             simbolo: str,
-                             ahora: Optional[datetime] = None) -> Tuple[bool, str]:
+    def es_horario_operativo(
+        self,
+        simbolo: str,
+        ahora: Optional[datetime] = None
+    ) -> Tuple[bool, str]:
         """
-        Verifica si el símbolo está en horario operativo.
-        
-        Args:
-            simbolo: Símbolo
-            ahora: Fecha de referencia
-        
-        Returns:
-            (es_operativo, razon)
+        Verifica si un símbolo está en horario operativo.
+        V9.10 - CORREGIDO DEFINITIVO: Maneja sábado y domingo correctamente.
         """
+        # ============================================================
+        # 1. VALIDAR / OBTENER HORA ACTUAL
+        # ============================================================
         if ahora is None:
             ahora = self.ahora_utc()
-        
-        # Verificar caché
-        cache_key = f"operativo_{simbolo}_{ahora.strftime('%Y-%m-%d %H:%M')}"
-        if cache_key in self._cache_validacion:
-            cached, timestamp = self._cache_validacion[cache_key]
-            if time.time() - timestamp < self.cache_ttl:
-                return cached
-        
-        hora_col = ahora.astimezone(self.ZONAS['COLOMBIA'])
+
+        hora_col = ahora.astimezone(self.ZONAS["COLOMBIA"])
         weekday_col = hora_col.weekday()
-        hora_col_float = hora_col.hour + hora_col.minute / 60.0
-        simbolo_upper = simbolo.upper()
-        
-        # 1. CRIPTO: 24/7
+        hora_col_float = (
+            hora_col.hour
+            + hora_col.minute / 60.0
+            + hora_col.second / 3600.0
+        )
+
+        simbolo_upper = simbolo.upper().strip()
+
+        # ============================================================
+        # 2. ✅ CRIPTO: SIEMPRE OPERATIVO (24/7)
+        # ============================================================
         if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
-            resultado = (True, "24/7 (Cripto)")
-            self._cache_validacion[cache_key] = (resultado, time.time())
-            return resultado
+            return (True, "24/7 (Cripto)")
+
+        # ============================================================
+        # 3. ✅ SÁBADO: SOLO CRIPTO OPERA
+        # ============================================================
+        if weekday_col == 5:  # Sábado
+            return (False, "Sábado - Solo cripto opera")
+
+        # ============================================================
+        # 4. ✅ DOMINGO: CRIPTO SIEMPRE, FOREX/ÍNDICES DESDE CIERTA HORA
+        # ============================================================
+        if weekday_col == 6:  # Domingo
+            # Forex: abre 22:00 UTC (17:00 COT)
+            if hora_col_float >= 17.0:
+                # ¿Es forex?
+                if self._es_forex(simbolo_upper):
+                    return (True, "Domingo - Forex abierto desde 17:00 COT")
+            
+            # Índices y Metales: abren 23:00 UTC (18:00 COT)
+            if hora_col_float >= 18.0:
+                if self._es_indice(simbolo_upper) or self._es_metal(simbolo_upper):
+                    return (True, "Domingo - Índices/Metales abiertos desde 18:00 COT")
+            
+            return (False, f"Domingo - Apertura próxima (Forex 17:00, Índices 18:00)")
+
+        # ============================================================
+        # 5. ✅ LUNES A VIERNES: HORARIO NORMAL
+        # ============================================================
         
-        # 2. SÁBADO: cerrado
+        # VIERNES: Cierres anticipados
+        if weekday_col == 4:  # Viernes
+            # ÍNDICES y METALES: cierran a las 16:00 COT
+            if self._es_indice(simbolo_upper) or self._es_metal(simbolo_upper):
+                if hora_col_float >= 16.0:
+                    return (False, "Viernes - Cierre de índices/metales (16:00 COT)")
+                else:
+                    return (True, "Viernes - Índices/Metales abiertos")
+            
+            # FOREX: cierra a las 17:00 COT
+            if self._es_forex(simbolo_upper):
+                if hora_col_float >= 17.0:
+                    return (False, "Viernes - Cierre de Forex (17:00 COT)")
+                else:
+                    return (True, "Viernes - Forex abierto")
+        
+        # ============================================================
+        # 6. OBTENER CONFIGURACIÓN DEL SÍMBOLO
+        # ============================================================
+        config = self.horarios_sesion.get(simbolo)
+        if not config:
+            # Si no hay configuración específica, usar horario genérico
+            if weekday_col in [0, 1, 2, 3, 4]:  # Lunes a Viernes
+                return (True, "Horario normal")
+            else:
+                return (False, "Sin horario configurado")
+
+        # ============================================================
+        # 7. VERIFICAR DÍA OPERATIVO
+        # ============================================================
+        dias_operativos = config.get("dias", [0, 1, 2, 3, 4])
+        if weekday_col not in dias_operativos:
+            dias_nombre = ("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo")
+            return (False, f"{dias_nombre[weekday_col]} - No operativo")
+
+        # ============================================================
+        # 8. OBTENER HORARIO CONFIGURADO
+        # ============================================================
+        inicio = config.get("inicio", 0)
+        fin = config.get("fin", 24)
+
+        # Operación 24 horas
+        if inicio == fin:
+            return (True, "24 horas")
+
+        # Rango normal (ej: 08:00 -> 17:00)
+        if inicio < fin:
+            if inicio <= hora_col_float < fin:
+                return (True, f"Operativo ({inicio:02d}:00-{fin:02d}:00 COT)")
+            return (False, f"Fuera de horario ({inicio:02d}:00-{fin:02d}:00 COT)")
+
+        # Rango que cruza medianoche (ej: 22:00 -> 06:00)
+        if hora_col_float >= inicio or hora_col_float < fin:
+            return (True, f"Operativo ({inicio:02d}:00-{fin:02d}:00 COT)")
+        return (False, f"Fuera de horario ({inicio:02d}:00-{fin:02d}:00 COT)")
+
+    # ============================================================
+    # MÉTODOS AUXILIARES PARA DETECCIÓN DE TIPO DE ACTIVO
+    # ============================================================
+
+    def _es_forex(self, simbolo: str) -> bool:
+        """Verifica si es un par de divisas."""
+        # Pares forex conocidos
+        pares_forex = [
+            'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'USDCHF',
+            'EURGBP', 'EURJPY', 'GBPJPY', 'AUDJPY', 'EURNZD', 'GBPAUD',
+            'EURCHF', 'GBPCHF', 'AUDCAD', 'AUDCHF', 'AUDNZD', 'CADJPY',
+            'CHFJPY', 'EURAUD', 'EURCAD', 'GBPAUD', 'GBPCAD', 'GBPCHF',
+            'NZDJPY', 'NZDUSD', 'USDSGD', 'USDHKD', 'USDMXN', 'USDZAR'
+        ]
+        return simbolo in pares_forex
+
+    def _es_indice(self, simbolo: str) -> bool:
+        """Verifica si es un índice."""
+        indices = ['US30', 'NAS100', 'US500', 'SP500', 'GER40', 'UK100', 'DAX', 'SPX']
+        return any(x in simbolo for x in indices)
+
+    def _es_metal(self, simbolo: str) -> bool:
+        """Verifica si es un metal precioso."""
+        metales = ['XAU', 'XAG', 'XPT', 'XPD']
+        return any(x in simbolo for x in metales)
+        # ============================================================
+        # 3. FUNCIÓN INTERNA PARA GUARDAR Y RETORNAR
+        # ============================================================
+        def finalizar(
+            operativo: bool,
+            motivo: str
+        ) -> Tuple[bool, str]:
+
+            resultado = (operativo, motivo)
+
+            self._cache_validacion[cache_key] = (
+                resultado,
+                time.time()
+            )
+
+            return resultado
+
+        # ============================================================
+        # ✅ CRIPTO: SIEMPRE OPERATIVO (24/7)
+        # ============================================================
+        if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
+            return (True, "24/7 (Cripto)")
+        
+        # ============================================================
+        # ✅ VERIFICAR SÁBADO
+        # ============================================================
         if weekday_col == 5:
-            resultado = (False, "Sábado - mercado cerrado")
-            self._cache_validacion[cache_key] = (resultado, time.time())
-            return resultado
+            return (False, "Sábado - mercado cerrado")
         
-        # 3. DOMINGO: cerrado hasta 17:00 COT
+        # ============================================================
+        # ✅ VERIFICAR DOMINGO
+        # ============================================================
         if weekday_col == 6:
             if hora_col_float < 17.0:
-                resultado = (False, f"Domingo - apertura 17:00 COT")
+                return (False, f"Domingo - apertura 17:00 COT")
             else:
-                resultado = (True, "Domingo - mercado abierto")
-            self._cache_validacion[cache_key] = (resultado, time.time())
-            return resultado
+                return (True, "Domingo - mercado abierto")
         
-        # 4. VIERNES: depende del tipo de activo
+        # ============================================================
+        # ✅ VERIFICAR VIERNES
+        # ============================================================
         if weekday_col == 4:
             # ÍNDICES y METALES: cierran a las 16:00 COT
             if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']) or \
-               any(x in simbolo_upper for x in ['XAU', 'XAG']):
+            any(x in simbolo_upper for x in ['XAU', 'XAG']):
                 if hora_col_float >= 16.0:
-                    resultado = (False, "Viernes - cierre de índices/metales (16:00 COT)")
+                    return (False, "Viernes - cierre de índices/metales (16:00 COT)")
                 else:
-                    resultado = (True, "Viernes - mercado abierto")
-                self._cache_validacion[cache_key] = (resultado, time.time())
-                return resultado
+                    return (True, "Viernes - mercado abierto")
             
             # FOREX: cierra a las 17:00 COT
             if hora_col_float >= 17.0:
-                resultado = (False, "Viernes - cierre de Forex (17:00 COT)")
+                return (False, "Viernes - cierre de Forex (17:00 COT)")
             else:
-                resultado = (True, "Viernes - mercado abierto")
-            self._cache_validacion[cache_key] = (resultado, time.time())
-            return resultado
+                return (True, "Viernes - mercado abierto")
         
-        # 5. LUNES: abierto después de 02:00 COT
-        if weekday_col == 0 and hora_col_float < 2.0:
-            resultado = (False, "Lunes - apertura 02:00 COT")
-            self._cache_validacion[cache_key] = (resultado, time.time())
-            return resultado
+        # ============================================================
+        # ✅ LUNES: SIEMPRE ABIERTO
+        # ============================================================
+        if weekday_col == 0:
+            return (True, "Lunes - mercado abierto")
         
-        # 6. Obtener configuración del símbolo
+        # ============================================================
+        # ✅ OBTENER CONFIGURACIÓN DEL SÍMBOLO
+        # ============================================================
         config = self.horarios_sesion.get(simbolo)
         if not config:
-            # Si no hay config, usar default (24/5 para Forex)
             if weekday_col in [0, 1, 2, 3, 4]:
-                resultado = (True, "Horario normal")
+                return (True, "Horario normal")
             else:
-                resultado = (False, "Sin horario configurado")
-            self._cache_validacion[cache_key] = (resultado, time.time())
-            return resultado
-        
-        # 7. Verificar día
-        dias_operativos = config.get('dias', [0, 1, 2, 3, 4])
+                return (False, "Sin horario configurado")
+        # ============================================================
+        # 10. VERIFICAR DÍA OPERATIVO
+        # ============================================================
+        dias_operativos = config.get(
+            "dias",
+            [0, 1, 2, 3, 4]
+        )
+
         if weekday_col not in dias_operativos:
-            dias_nombre = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo']
-            resultado = (False, f"{dias_nombre[weekday_col]} - no operativo")
-            self._cache_validacion[cache_key] = (resultado, time.time())
-            return resultado
-        
-        # 8. Verificar hora
-        inicio = config.get('inicio', 0)
-        fin = config.get('fin', 24)
-        
+
+            dias_nombre = (
+                "Lunes",
+                "Martes",
+                "Miércoles",
+                "Jueves",
+                "Viernes",
+                "Sábado",
+                "Domingo"
+            )
+
+            return finalizar(
+                False,
+                f"{dias_nombre[weekday_col]} - no operativo"
+            )
+
+        # ============================================================
+        # 11. OBTENER HORARIO CONFIGURADO
+        # ============================================================
+        inicio = config.get("inicio", 0)
+        fin = config.get("fin", 24)
+
+        # ============================================================
+        # 12. OPERACIÓN 24 HORAS
+        # ============================================================
         if inicio == fin:
-            resultado = (True, "24 horas")
-            self._cache_validacion[cache_key] = (resultado, time.time())
-            return resultado
-        
+            return finalizar(
+                True,
+                "24 horas"
+            )
+
+        # ============================================================
+        # 13. RANGO NORMAL
+        #    Ejemplo: 08:00 -> 17:00
+        # ============================================================
         if inicio < fin:
+
             if inicio <= hora_col_float < fin:
-                resultado = (True, f"Operativo ({inicio:02d}:00-{fin:02d}:00 COT)")
-            else:
-                resultado = (False, f"Fuera de horario ({inicio:02d}:00-{fin:02d}:00 COT)")
-        else:
-            # Rango que cruza medianoche
-            if hora_col_float >= inicio or hora_col_float < fin:
-                resultado = (True, f"Operativo ({inicio:02d}:00-{fin:02d}:00 COT)")
-            else:
-                resultado = (False, f"Fuera de horario ({inicio:02d}:00-{fin:02d}:00 COT)")
-        
-        self._cache_validacion[cache_key] = (resultado, time.time())
-        return resultado
-    
+                return finalizar(
+                    True,
+                    f"Operativo ({inicio:02d}:00-{fin:02d}:00 COT)"
+                )
+
+            return finalizar(
+                False,
+                f"Fuera de horario ({inicio:02d}:00-{fin:02d}:00 COT)"
+            )
+
+        # ============================================================
+        # 14. RANGO QUE CRUZA MEDIANOCHE
+        #    Ejemplo: 22:00 -> 06:00
+        # ============================================================
+        if hora_col_float >= inicio or hora_col_float < fin:
+
+            return finalizar(
+                True,
+                f"Operativo ({inicio:02d}:00-{fin:02d}:00 COT)"
+            )
+
+        return finalizar(
+            False,
+            f"Fuera de horario ({inicio:02d}:00-{fin:02d}:00 COT)"
+        )
     # ============================================================
     # VALIDACIÓN DE CIERRE DE VIERNES
     # ============================================================
@@ -1098,13 +1227,37 @@ class HorarioMercado:
     # MÉTODOS DE COMPATIBILIDAD (LEGACY)
     # ============================================================
     
-    def mercado_abierto_legacy(self) -> bool:
+    def mercado_abierto(self, ahora: Optional[datetime] = None) -> bool:
         """
-        Versión legacy de mercado_abierto.
-        DEPRECADO - Usar mercado_abierto() en su lugar.
+        Determina si el mercado está abierto.
+        V9.10 - CORREGIDO: Considera cripto 24/7.
         """
-        return self.mercado_abierto()
-    
+        if ahora is None:
+            ahora = self.ahora_utc()
+        
+        weekday_utc = ahora.weekday()
+        hora_utc_float = ahora.hour + ahora.minute / 60.0
+        
+        # ============================================================
+        # ✅ CRIPTO: SIEMPRE ABIERTO (24/7)
+        # ============================================================
+        # Este método es para mercado tradicional.
+        # El filtrado por símbolo se hace en es_horario_operativo().
+        
+        # Sábado: cerrado para Forex/Índices/Metales
+        if weekday_utc == 5:
+            return False
+        
+        # Domingo: cerrado hasta 22:00 UTC (17:00 COT)
+        if weekday_utc == 6 and hora_utc_float < 22.0:
+            return False
+        
+        # Viernes: cerrado después de 22:00 UTC (17:00 COT)
+        if weekday_utc == 4 and hora_utc_float >= 22.0:
+            return False
+        
+        return True
+        
     def es_horario_operativo_legacy(self, simbolo: str) -> Tuple[bool, str]:
         """
         Versión legacy de es_horario_operativo.

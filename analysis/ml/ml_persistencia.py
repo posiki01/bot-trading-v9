@@ -1,266 +1,159 @@
 #!/usr/bin/env python3
 """
 analysis/ml/ml_persistencia.py (V9.0)
-Persistencia de pesos y métricas del modelo ML.
+Persistencia de datos ML.
 """
 
 import json
 import os
-import logging
 from pathlib import Path
-from typing import Dict, Any, Optional, List
-from datetime import datetime, timezone
+from typing import Dict, Any, Optional
+import logging
 
 logger = logging.getLogger('BotTrading.ML.Persistencia')
 
 
-class MLPersistencia:
+class MLCache:
     """
-    Gestor de persistencia para el modelo ML.
-    V9.0 - INDEPENDIENTE.
+    Caché y persistencia de datos ML.
+    V9.0 - COMPLETO.
     """
     
-    # Pesos por defecto
-    PESOS_DEFECTO = {
-        'w_tecnica': 0.35,
-        'w_institucional': 0.45,
-        'w_fundamental': 0.20,
-        'bias': 0.0,
-        'bias_compra': 0.0,
-        'bias_venta': 0.0,
-    }
-    
-    def __init__(self, base_dir: Optional[Path] = None, almacen: Optional[Any] = None):
+    def __init__(self, almacen: Optional[Any] = None, base_dir: Path = Path("data")):
         """
-        Inicializa el gestor de persistencia.
+        Inicializa la caché ML.
         
         Args:
-            base_dir: Directorio base para archivos
             almacen: Almacenamiento SQLite (opcional)
+            base_dir: Directorio base para archivos
         """
-        self.base_dir = Path(base_dir) if base_dir else Path("data")
         self.almacen = almacen
+        self.base_dir = Path(base_dir)
+        self.base_dir.mkdir(parents=True, exist_ok=True)
         
         # Rutas de archivos
         self.ruta_pesos = self.base_dir / "ml_weights.json"
+        self.ruta_metricas = self.base_dir / "ml_metrics.json"
+        self.ruta_metadata = self.base_dir / "ml_metadata.json"
         self.ruta_historial_metricas = self.base_dir / "ml_metrics_history.json"
         self.ruta_historial_pesos = self.base_dir / "ml_weights_history.json"
-        self.ruta_metadata = self.base_dir / "ml_metadata.json"
-        
-        # Crear directorio
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-        
-        logger.info(f"📁 MLPersistencia V9.0 inicializado en {self.base_dir}")
     
-    # ================================================================
-    # PESOS
-    # ================================================================
-    
-    def cargar_pesos(self) -> Dict[str, float]:
-        """
-        Carga pesos desde archivo.
+    def cargar_pesos(self) -> Optional[Dict]:
+        """Carga pesos desde archivo."""
+        # Intentar desde almacenamiento primero
+        if self.almacen:
+            try:
+                config = self.almacen.obtener_configuracion()
+                if config and 'ml_weights' in config:
+                    return config['ml_weights']
+            except Exception:
+                pass
         
-        Returns:
-            Diccionario con pesos
-        """
+        # Fallback: archivo JSON
         if not self.ruta_pesos.exists():
-            logger.debug("No hay pesos guardados, usando valores por defecto")
-            return self.PESOS_DEFECTO.copy()
+            return None
         
         try:
-            with open(self.ruta_pesos, 'r', encoding='utf-8') as f:
-                pesos = json.load(f)
-            
-            # Validar que tiene las claves correctas
-            for key in self.PESOS_DEFECTO:
-                if key not in pesos:
-                    pesos[key] = self.PESOS_DEFECTO[key]
-            
-            logger.debug(f"🧠 Pesos cargados: {pesos}")
-            return pesos
-            
+            with open(self.ruta_pesos, 'r') as f:
+                return json.load(f)
         except Exception as e:
-            logger.warning(f"⚠️ Error cargando pesos: {e}")
-            return self.PESOS_DEFECTO.copy()
+            logger.debug(f"Error cargando pesos: {e}")
+            return None
     
-    def guardar_pesos(self, pesos: Dict[str, float]) -> bool:
-        """
-        Guarda pesos en archivo.
+    def guardar_pesos(self, pesos: Dict):
+        """Guarda pesos en archivo."""
+        # Guardar en almacenamiento
+        if self.almacen:
+            try:
+                config = self.almacen.obtener_configuracion()
+                config['ml_weights'] = pesos
+                self.almacen.guardar_configuracion(config)
+            except Exception:
+                pass
         
-        Args:
-            pesos: Diccionario con pesos
-        
-        Returns:
-            True si se guardó correctamente
-        """
+        # Guardar en archivo
         try:
-            # Asegurar que todas las claves existen
-            pesos_completos = self.PESOS_DEFECTO.copy()
-            pesos_completos.update(pesos)
-            
-            with open(self.ruta_pesos, 'w', encoding='utf-8') as f:
-                json.dump(pesos_completos, f, indent=2)
-            
-            logger.debug("🧠 Pesos guardados")
-            return True
-            
+            with open(self.ruta_pesos, 'w') as f:
+                json.dump(pesos, f, indent=2)
         except Exception as e:
-            logger.error(f"❌ Error guardando pesos: {e}")
-            return False
+            logger.warning(f"Error guardando pesos: {e}")
     
-    # ================================================================
-    # HISTORIAL
-    # ================================================================
+    def cargar_metricas(self) -> Optional[Dict]:
+        """Carga métricas desde archivo."""
+        if not self.ruta_metricas.exists():
+            return None
+        
+        try:
+            with open(self.ruta_metricas, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.debug(f"Error cargando métricas: {e}")
+            return None
     
-    def cargar_historial_metricas(self) -> List[Dict]:
+    def guardar_metricas(self, metricas: Dict):
+        """Guarda métricas en archivo."""
+        try:
+            with open(self.ruta_metricas, 'w') as f:
+                json.dump(metricas, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Error guardando métricas: {e}")
+    
+    def cargar_metadata(self) -> Optional[Dict]:
+        """Carga metadata desde archivo."""
+        if not self.ruta_metadata.exists():
+            return None
+        
+        try:
+            with open(self.ruta_metadata, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.debug(f"Error cargando metadata: {e}")
+            return None
+    
+    def guardar_metadata(self, metadata: Dict):
+        """Guarda metadata en archivo."""
+        try:
+            with open(self.ruta_metadata, 'w') as f:
+                json.dump(metadata, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Error guardando metadata: {e}")
+    
+    def cargar_historial_metricas(self) -> Optional[list]:
         """Carga historial de métricas."""
         if not self.ruta_historial_metricas.exists():
-            return []
+            return None
         
         try:
-            with open(self.ruta_historial_metricas, 'r', encoding='utf-8') as f:
+            with open(self.ruta_historial_metricas, 'r') as f:
                 return json.load(f)
         except Exception as e:
-            logger.warning(f"⚠️ Error cargando historial de métricas: {e}")
-            return []
+            logger.debug(f"Error cargando historial de métricas: {e}")
+            return None
     
-    def guardar_historial_metricas(self, historial: List[Dict]) -> bool:
+    def guardar_historial_metricas(self, historial: list):
         """Guarda historial de métricas."""
         try:
-            # Limitar tamaño
-            if len(historial) > 2000:
-                historial = historial[-2000:]
-            
-            with open(self.ruta_historial_metricas, 'w', encoding='utf-8') as f:
+            with open(self.ruta_historial_metricas, 'w') as f:
                 json.dump(historial, f, indent=2)
-            
-            return True
         except Exception as e:
-            logger.error(f"❌ Error guardando historial de métricas: {e}")
-            return False
+            logger.warning(f"Error guardando historial de métricas: {e}")
     
-    def cargar_historial_pesos(self) -> List[Dict]:
+    def cargar_historial_pesos(self) -> Optional[list]:
         """Carga historial de pesos."""
         if not self.ruta_historial_pesos.exists():
-            return []
+            return None
         
         try:
-            with open(self.ruta_historial_pesos, 'r', encoding='utf-8') as f:
+            with open(self.ruta_historial_pesos, 'r') as f:
                 return json.load(f)
         except Exception as e:
-            logger.warning(f"⚠️ Error cargando historial de pesos: {e}")
-            return []
+            logger.debug(f"Error cargando historial de pesos: {e}")
+            return None
     
-    def guardar_historial_pesos(self, historial: List[Dict]) -> bool:
+    def guardar_historial_pesos(self, historial: list):
         """Guarda historial de pesos."""
         try:
-            # Limitar tamaño
-            if len(historial) > 2000:
-                historial = historial[-2000:]
-            
-            with open(self.ruta_historial_pesos, 'w', encoding='utf-8') as f:
+            with open(self.ruta_historial_pesos, 'w') as f:
                 json.dump(historial, f, indent=2)
-            
-            return True
         except Exception as e:
-            logger.error(f"❌ Error guardando historial de pesos: {e}")
-            return False
-    
-    # ================================================================
-    # METADATA
-    # ================================================================
-    
-    def cargar_metadata(self) -> Dict[str, Any]:
-        """Carga metadata del modelo."""
-        if not self.ruta_metadata.exists():
-            return {}
-        
-        try:
-            with open(self.ruta_metadata, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            logger.warning(f"⚠️ Error cargando metadata: {e}")
-            return {}
-    
-    def guardar_metadata(self, metadata: Dict[str, Any]) -> bool:
-        """Guarda metadata del modelo."""
-        try:
-            metadata['version'] = '9.0'
-            metadata['updated_at'] = datetime.now(timezone.utc).isoformat()
-            
-            with open(self.ruta_metadata, 'w', encoding='utf-8') as f:
-                json.dump(metadata, f, indent=2)
-            
-            return True
-        except Exception as e:
-            logger.error(f"❌ Error guardando metadata: {e}")
-            return False
-    
-    # ================================================================
-    # EXPORTACIÓN
-    # ================================================================
-    
-    def exportar_modelo(self, ruta: Optional[Path] = None) -> bool:
-        """
-        Exporta todo el estado del modelo.
-        
-        Args:
-            ruta: Ruta del archivo (opcional)
-        
-        Returns:
-            True si se exportó correctamente
-        """
-        if ruta is None:
-            ruta = self.base_dir / f"ml_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        
-        try:
-            data = {
-                'pesos': self.cargar_pesos(),
-                'metadata': self.cargar_metadata(),
-                'historial_metricas': self.cargar_historial_metricas(),
-                'historial_pesos': self.cargar_historial_pesos(),
-                'exported_at': datetime.now(timezone.utc).isoformat(),
-            }
-            
-            with open(ruta, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2)
-            
-            logger.info(f"📊 Modelo exportado a {ruta}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Error exportando modelo: {e}")
-            return False
-    
-    def importar_modelo(self, ruta: Path) -> bool:
-        """
-        Importa un modelo exportado.
-        
-        Args:
-            ruta: Ruta del archivo
-        
-        Returns:
-            True si se importó correctamente
-        """
-        try:
-            with open(ruta, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            if 'pesos' in data:
-                self.guardar_pesos(data['pesos'])
-            
-            if 'metadata' in data:
-                self.guardar_metadata(data['metadata'])
-            
-            if 'historial_metricas' in data:
-                self.guardar_historial_metricas(data['historial_metricas'])
-            
-            if 'historial_pesos' in data:
-                self.guardar_historial_pesos(data['historial_pesos'])
-            
-            logger.info(f"📥 Modelo importado desde {ruta}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Error importando modelo: {e}")
-            return False
+            logger.warning(f"Error guardando historial de pesos: {e}")

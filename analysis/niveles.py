@@ -1,726 +1,396 @@
 #!/usr/bin/env python3
 """
-analysis/niveles.py (V9.0 - REFACTORIZADO COMPLETAMENTE)
-Sistema de niveles persistente con historial y multi-timeframe.
+analysis/niveles.py (V9.6 - CORRECCIÓN DE ZONAS HORARIAS)
+Sistema de detección y acumulación de niveles de soporte y resistencia.
 
-RESPONSABILIDADES:
-- Persistencia de niveles en SQLite
-- Validación de niveles
-- Caché en memoria
-- Limpieza de niveles antiguos
-- Integración con detector de niveles
-
-MEJORAS V9.0:
-- Separación de detección y persistencia
-- Integración con umbrales centralizados
-- Caché mejorada con invalidación
-- Validación más robusta
-- Limpieza automática de niveles antiguos
-- Logs más informativos
+MEJORAS V9.6:
+- Corregido error de zonas horarias en _limpiar_niveles_antiguos.
+- Carga niveles de TODOS los timeframes desde SQLite.
+- Logs mejorados para depuración.
 """
 
 import logging
-import time
-import pandas as pd
-from typing import Dict, Any, Optional, List, Tuple
+import sqlite3
+from typing import Dict, List, Optional, Tuple, Any
+from collections import defaultdict
 from datetime import datetime, timezone, timedelta
+import pandas as pd
+import numpy as np
 
-# Importar submódulos
-from analysis.niveles_deteccion import DetectorNiveles
-
-# Importar umbrales centralizados
-try:
-    from config.umbrales import Umbrales
-except ImportError:
-    Umbrales = None
-
-logger = logging.getLogger('BotTrading.Niveles')
+logger = logging.getLogger('BotTrading.NivelTracker')
 
 
 class NivelTracker:
     """
-    Sistema de niveles persistente multi-timeframe.
-    V9.0 - REFACTORIZADO COMPLETAMENTE.
+    Sistema de detección y acumulación de niveles de soporte/resistencia.
+    V9.6 - CORRECCIÓN DE ZONAS HORARIAS.
     """
-    
-    # ============================================================
-    # CONFIGURACIÓN POR TIMEFRAME
-    # ============================================================
-    
-    CONFIG_POR_TIMEFRAME = {
-        'H1': {
-            'dias_antiguedad_max': 10,
-            'hits_minimos': 2,
-            'fuerza_minima': 30,
-            'distancia_agrupacion': 0.002,
-            'max_niveles': 15,
-            'fuerza_inicial': 20,
-        },
-        'H4': {
-            'dias_antiguedad_max': 30,
-            'hits_minimos': 2,
-            'fuerza_minima': 40,
-            'distancia_agrupacion': 0.003,
-            'max_niveles': 10,
-            'fuerza_inicial': 35,
-        },
-        'D1': {
-            'dias_antiguedad_max': 90,
-            'hits_minimos': 2,
-            'fuerza_minima': 50,
-            'distancia_agrupacion': 0.005,
-            'max_niveles': 8,
-            'fuerza_inicial': 50,
-        },
-        'M15': {
-            'dias_antiguedad_max': 2,
-            'hits_minimos': 1,
-            'fuerza_minima': 15,
-            'distancia_agrupacion': 0.001,
-            'max_niveles': 5,
-            'fuerza_inicial': 10,
-        },
-        'M5': {
-            'dias_antiguedad_max': 1,
-            'hits_minimos': 1,
-            'fuerza_minima': 10,
-            'distancia_agrupacion': 0.001,
-            'max_niveles': 3,
-            'fuerza_inicial': 5,
-        },
-    }
-    
-    TIMEFRAME_DEFAULT = 'H1'
-    
-    def __init__(self,
-                 almacen: Optional[Any] = None,
-                 config: Optional[Any] = None,
-                 detector: Optional[DetectorNiveles] = None,
-                 modo_backtest: bool = False,
-                 timeframe_default: str = 'H1'):
+
+    # Configuración
+    NIVEL_LOOKBACK = 50  # Velas H1 para detectar niveles (en producción)
+    NIVEL_TOLERANCIA_PCT = 0.002  # 0.2% de tolerancia para agrupar niveles
+    NIVEL_MIN_HITS = 2  # Mínimo de toques para considerar un nivel válido
+    NIVEL_MAX_EDAD_DIAS = 7  # Máxima edad de un nivel antes de decaer
+    NIVEL_DECAY_HITS = 0.5  # Reducción de hits por cada día de antigüedad
+
+    def __init__(self, almacen: Optional[Any] = None, config: Optional[Any] = None,
+                 modo_backtest: bool = False):
         """
         Inicializa el tracker de niveles.
-        
+
         Args:
-            almacen: Almacenamiento SQLite
+            almacen: Almacenamiento SQLite (para persistencia real)
             config: Configuración
-            detector: Detector de niveles (opcional)
-            modo_backtest: Modo backtest
-            timeframe_default: Timeframe por defecto
+            modo_backtest: Modo backtest (mayor acumulación)
         """
         self.almacen = almacen
         self.config = config
         self.modo_backtest = modo_backtest
-        self.timeframe_default = timeframe_default
-        self.logger = logging.getLogger('BotTrading.Niveles')
-        
-        # Inicializar detector
-        self.detector = detector or DetectorNiveles(config)
-        
-        # Cargar configuración desde umbrales
-        self._cargar_configuracion()
-        
-        # Caché
-        self._cache_niveles: Dict[str, Dict] = {}
-        self._cache_timestamp: Dict[str, float] = {}
-        self._cache_ttl = 60  # segundos
-        
-        # Cargar niveles iniciales desde almacenamiento
+        self.logger = logging.getLogger('BotTrading.NivelTracker')
+
+        # Ajustes para backtest
+        if self.modo_backtest:
+            self.NIVEL_LOOKBACK = 100
+            self.NIVEL_MIN_HITS = 1
+            self.NIVEL_MAX_EDAD_DIAS = 14
+
+        # ✅ MEMORIA DE NIVELES
+        self._niveles_memoria: Dict[str, Dict[str, List[Dict]]] = defaultdict(lambda: {
+            'soportes': [],
+            'resistencias': []
+        })
+
+        # ✅ Caché de últimas detecciones
+        self._ultima_deteccion: Dict[str, datetime] = {}
+
+        # Cargar niveles desde SQLite (TODOS los timeframes)
         self._cargar_niveles_iniciales()
-        
-        self.logger.info(f"📊 NivelTracker V9.0 inicializado")
-        self.logger.info(f"   Timeframe principal: {timeframe_default}")
+
+        self.logger.info(f"📊 NivelTracker V9.6 CORRECCIÓN ZONAS HORARIAS inicializado")
         self.logger.info(f"   Backtest: {modo_backtest}")
-        self.logger.info(f"   Caché TTL: {self._cache_ttl}s")
-    
-    def _cargar_configuracion(self):
-        """Carga configuración desde umbrales centralizados."""
-        if Umbrales is not None:
-            # Actualizar configuración por timeframe desde umbrales
-            for tf in self.CONFIG_POR_TIMEFRAME:
-                if hasattr(Umbrales, 'HITS'):
-                    self.CONFIG_POR_TIMEFRAME[tf]['hits_minimos'] = \
-                        Umbrales.HITS.get(f'hits_min_{tf.lower()}', 
-                                          self.CONFIG_POR_TIMEFRAME[tf]['hits_minimos'])
-        
-        # Cargar desde config
-        if self.config and hasattr(self.config, 'UMBRALES_DETECCION_NIVELES'):
-            umbrales = getattr(self.config, 'UMBRALES_DETECCION_NIVELES', {})
-            for tf in self.CONFIG_POR_TIMEFRAME:
-                if tf in umbrales:
-                    self.CONFIG_POR_TIMEFRAME[tf].update(umbrales[tf])
-    
+
+    # ============================================================
+    # CARGA DESDE SQLITE
+    # ============================================================
+
     def _cargar_niveles_iniciales(self):
-        """Carga niveles iniciales desde almacenamiento."""
+        """
+        Carga niveles desde la base de datos SQLite.
+        CORREGIDO: Carga TODOS los timeframes, no solo H1.
+        """
         if not self.almacen:
             return
         
         try:
-            # Cargar para todos los símbolos (si es posible)
-            if hasattr(self.almacen, 'obtener_todos_simbolos'):
-                simbolos = self.almacen.obtener_todos_simbolos()
-                for simbolo in simbolos:
-                    self._cargar_niveles_desde_almacen(simbolo)
+            conn = sqlite3.connect(self.almacen.base_dir / "bot_data.db")
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+            SELECT simbolo, timeframe, tipo, precio, hits, fuerza, fecha_deteccion, fecha_ultimo_toque
+            FROM niveles_por_timeframe
+            """)
+            
+            rows = cursor.fetchall()
+            conn.close()
+            
+            simbolos_cargados = set()
+            total_niveles = 0
+            
+            for row in rows:
+                simbolo = row[0]
+                timeframe = row[1]
+                tipo = row[2]
+                precio = row[3]
+                hits = row[4]
+                fuerza = row[5]
+                fecha_deteccion = row[6]
+                fecha_ultimo_toque = row[7]
+                
+                nivel = {
+                    'precio': precio,
+                    'hits': hits,
+                    'fuerza': fuerza,
+                    'fecha_deteccion': fecha_deteccion,
+                    'fecha_ultimo_toque': fecha_ultimo_toque,
+                    'tipo': tipo,
+                    'timeframe': timeframe  # ✅ Añadir timeframe al nivel
+                }
+                
+                if tipo == 'soporte':
+                    self._niveles_memoria[simbolo]['soportes'].append(nivel)
+                elif tipo == 'resistencia':
+                    self._niveles_memoria[simbolo]['resistencias'].append(nivel)
+                
+                simbolos_cargados.add(simbolo)
+                total_niveles += 1
+            
+            self.logger.info(f"📦 Niveles cargados desde SQLite para {len(simbolos_cargados)} símbolos")
+            self.logger.info(f"   Total niveles: {total_niveles}")
+            
+            # Log detallado por símbolo
+            for simbolo in simbolos_cargados:
+                soportes = len(self._niveles_memoria[simbolo]['soportes'])
+                resistencias = len(self._niveles_memoria[simbolo]['resistencias'])
+                if soportes > 0 or resistencias > 0:
+                    self.logger.info(f"   {simbolo}: {soportes} soportes, {resistencias} resistencias")
+            
         except Exception as e:
-            self.logger.debug(f"Error cargando niveles iniciales: {e}")
-    
+            self.logger.warning(f"⚠️ Error cargando niveles desde SQLite: {e}")
+
+    def _guardar_niveles(self, simbolo: str):
+        """Guarda niveles en almacenamiento (opcional)."""
+        if self.almacen:
+            try:
+                soportes = self._niveles_memoria[simbolo]['soportes']
+                resistencias = self._niveles_memoria[simbolo]['resistencias']
+                
+                self.almacen.guardar_niveles_por_timeframe(
+                    simbolo=simbolo,
+                    timeframe=60,
+                    soportes=soportes,
+                    resistencias=resistencias
+                )
+            except Exception as e:
+                self.logger.debug(f"No se pudieron guardar niveles: {e}")
+
     # ============================================================
-    # MÉTODOS PRINCIPALES
+    # MÉTODO PRINCIPAL
     # ============================================================
-    
+
     def detectar_y_actualizar_niveles(self,
                                       simbolo: str,
                                       df: pd.DataFrame,
-                                      precio_actual: float,
-                                      timeframe: str = 'H1') -> Dict[str, List]:
+                                      precio_actual: float) -> Dict[str, List[float]]:
         """
-        Detecta niveles y los actualiza en el historial.
-        
-        Args:
-            simbolo: Símbolo
-            df: DataFrame del timeframe correspondiente
-            precio_actual: Precio actual
-            timeframe: Timeframe usado
-        
-        Returns:
-            Niveles válidos del timeframe
+        Detecta nuevos niveles y los acumula en la memoria.
         """
-        # 1. Detectar niveles usando el detector
-        niveles_detectados = self.detector.detectar_niveles(df, simbolo, timeframe)
-        
-        if not niveles_detectados.get('soportes') and not niveles_detectados.get('resistencias'):
-            # Si no se detectaron niveles, usar detección de respaldo
-            niveles_detectados = self._detectar_niveles_fallback(df, simbolo, timeframe)
-        
-        # 2. Actualizar en almacenamiento
-        for nivel in niveles_detectados.get('soportes', []):
-            self._actualizar_nivel(simbolo, nivel, timeframe)
-        
-        for nivel in niveles_detectados.get('resistencias', []):
-            self._actualizar_nivel(simbolo, nivel, timeframe)
-        
-        # 3. Limpiar caché
-        self._invalidar_cache(simbolo, timeframe)
-        
-        # 4. Obtener niveles válidos
-        return self.obtener_niveles_validos(simbolo, timeframe=timeframe)
-    
-    def _detectar_niveles_fallback(self,
-                                   df: pd.DataFrame,
-                                   simbolo: str,
-                                   timeframe: str) -> Dict[str, List]:
-        """
-        Detección de niveles simplificada (fallback).
-        """
-        if df is None or len(df) < 30:
-            return {'soportes': [], 'resistencias': []}
-        
-        config = self.CONFIG_POR_TIMEFRAME.get(timeframe, self.CONFIG_POR_TIMEFRAME['H1'])
-        
-        soportes = []
-        resistencias = []
-        
-        # Usar mínimos y máximos de ventanas
-        window = config.get('ventana', 10)
-        
-        for i in range(window, len(df) - window, 3):
-            if df['Low'].iloc[i] == df['Low'].iloc[i-window:i+window].min():
-                precio = df['Low'].iloc[i]
-                soportes.append({
-                    'precio': precio,
-                    'hits': 1,
-                    'fuerza': config.get('fuerza_inicial', 20),
-                    'tipo': 'soporte',
-                    'timeframe': timeframe,
-                })
-            
-            if df['High'].iloc[i] == df['High'].iloc[i-window:i+window].max():
-                precio = df['High'].iloc[i]
-                resistencias.append({
-                    'precio': precio,
-                    'hits': 1,
-                    'fuerza': config.get('fuerza_inicial', 20),
-                    'tipo': 'resistencia',
-                    'timeframe': timeframe,
-                })
-        
-        # Agrupar niveles cercanos
-        soportes = self.detector.agrupar_niveles_cercanos(
-            soportes, config.get('distancia_agrupacion', 0.002)
+        if df is None or len(df) < self.NIVEL_LOOKBACK:
+            return {
+                'soportes': self._niveles_memoria[simbolo]['soportes'],
+                'resistencias': self._niveles_memoria[simbolo]['resistencias']
+            }
+
+        # ✅ 1. Limpiar niveles antiguos
+        self._limpiar_niveles_antiguos(simbolo)
+
+        # ✅ 2. Detectar nuevos niveles en la última vela
+        nuevos_soportes, nuevas_resistencias = self._detectar_niveles_ultima_vela(
+            simbolo, df, precio_actual
         )
-        resistencias = self.detector.agrupar_niveles_cercanos(
-            resistencias, config.get('distancia_agrupacion', 0.002)
-        )
-        
+
+        # ✅ 3. Acumular nuevos niveles
+        if nuevos_soportes:
+            for nivel in nuevos_soportes:
+                precio = nivel['precio']
+                hits = nivel.get('hits', 1)
+                self._acumular_nivel(simbolo, 'soportes', precio, hits)
+
+        if nuevas_resistencias:
+            for nivel in nuevas_resistencias:
+                precio = nivel['precio']
+                hits = nivel.get('hits', 1)
+                self._acumular_nivel(simbolo, 'resistencias', precio, hits)
+
+        # ✅ 4. Ordenar y devolver niveles acumulados
+        soportes = sorted(self._niveles_memoria[simbolo]['soportes'],
+                         key=lambda x: x['precio'], reverse=False)
+        resistencias = sorted(self._niveles_memoria[simbolo]['resistencias'],
+                            key=lambda x: x['precio'], reverse=True)
+
+        # ✅ 5. Actualizar caché
+        self._ultima_deteccion[simbolo] = datetime.now(timezone.utc)
+
         return {
-            'soportes': soportes[:config.get('max_niveles', 10)],
-            'resistencias': resistencias[:config.get('max_niveles', 10)],
+            'soportes': soportes,
+            'resistencias': resistencias
         }
-    
+
     # ============================================================
-    # VALIDACIÓN DE NIVELES
+    # DETECCIÓN DE NIVELES
     # ============================================================
-    
-    def validar_nivel(self,
-                      simbolo: str,
-                      precio: float,
-                      tipo: str,
-                      fecha_actual: Optional[datetime] = None,
-                      timeframe: str = 'H1') -> Tuple[bool, str, Dict]:
-        """
-        Valida si un nivel sigue siendo válido.
-        
-        Args:
-            simbolo: Símbolo
-            precio: Precio del nivel
-            tipo: 'soporte' o 'resistencia'
-            fecha_actual: Fecha de referencia
-            timeframe: Timeframe
-        
-        Returns:
-            (es_valido, razon, nivel_data)
-        """
-        if fecha_actual is None:
-            fecha_actual = datetime.now(timezone.utc)
-        if fecha_actual.tzinfo is None:
-            fecha_actual = fecha_actual.replace(tzinfo=timezone.utc)
-        
-        # Buscar nivel en caché o almacenamiento
-        nivel = self._buscar_nivel(simbolo, precio, tipo, timeframe)
-        
-        if not nivel:
-            return False, "Nivel no encontrado", {}
-        
-        # Obtener configuración para este timeframe
-        config = self.CONFIG_POR_TIMEFRAME.get(timeframe, self.CONFIG_POR_TIMEFRAME['H1'])
-        
-        hits = nivel.get('hits', 0)
-        fuerza = nivel.get('fuerza', 0)
-        
-        # 1. Validar hits
-        if hits < config.get('hits_minimos', 2):
-            return False, f"Hits insuficientes ({hits} < {config.get('hits_minimos', 2)})", nivel
-        
-        # 2. Validar fuerza
-        if fuerza < config.get('fuerza_minima', 30):
-            return False, f"Fuerza insuficiente ({fuerza} < {config.get('fuerza_minima', 30)})", nivel
-        
-        # 3. Validar antigüedad
-        try:
-            ultima_fecha_str = nivel.get('ultima_fecha')
-            if ultima_fecha_str:
-                ultima_fecha = datetime.fromisoformat(ultima_fecha_str)
-                if ultima_fecha.tzinfo is None:
-                    ultima_fecha = ultima_fecha.replace(tzinfo=timezone.utc)
-                
-                dias = (fecha_actual - ultima_fecha).days
-                dias_max = config.get('dias_antiguedad_max', 10)
-                
-                if dias > dias_max:
-                    return False, f"Nivel muy antiguo ({dias} días > {dias_max})", nivel
-        except Exception as e:
-            self.logger.debug(f"Error validando antigüedad: {e}")
-        
-        return True, "Nivel válido", nivel
-    
-    # ============================================================
-    # CONSULTA DE NIVELES
-    # ============================================================
-    
-    def obtener_niveles_validos(self,
-                                simbolo: str,
-                                fecha_actual: Optional[datetime] = None,
-                                timeframe: str = 'H1') -> Dict[str, List]:
-        """
-        Obtiene todos los niveles válidos para un símbolo.
-        
-        Args:
-            simbolo: Símbolo
-            fecha_actual: Fecha de referencia
-            timeframe: Timeframe
-        
-        Returns:
-            Diccionario con 'soportes' y 'resistencias'
-        """
-        if fecha_actual is None:
-            fecha_actual = datetime.now(timezone.utc)
-        if fecha_actual.tzinfo is None:
-            fecha_actual = fecha_actual.replace(tzinfo=timezone.utc)
-        
-        # Verificar caché
-        cache_key = f"{simbolo}_{timeframe}"
-        if cache_key in self._cache_niveles:
-            if time.time() - self._cache_timestamp.get(cache_key, 0) < self._cache_ttl:
-                return self._cache_niveles[cache_key].copy()
-        
-        # Cargar desde almacenamiento
-        niveles = self._cargar_niveles_desde_almacen(simbolo, timeframe)
-        
-        # Validar cada nivel
-        soportes_validos = []
-        resistencias_validas = []
-        
-        for nivel in niveles.get('soportes', []):
-            valido, _, data = self.validar_nivel(
-                simbolo, nivel.get('precio', 0), 'soporte',
-                fecha_actual, timeframe
-            )
-            if valido:
-                soportes_validos.append(data)
-        
-        for nivel in niveles.get('resistencias', []):
-            valido, _, data = self.validar_nivel(
-                simbolo, nivel.get('precio', 0), 'resistencia',
-                fecha_actual, timeframe
-            )
-            if valido:
-                resistencias_validas.append(data)
-        
-        # Ordenar por hits
-        soportes_validos.sort(key=lambda x: x.get('hits', 0), reverse=True)
-        resistencias_validas.sort(key=lambda x: x.get('hits', 0), reverse=True)
-        
-        # Limitar cantidad
-        config = self.CONFIG_POR_TIMEFRAME.get(timeframe, self.CONFIG_POR_TIMEFRAME['H1'])
-        max_niveles = config.get('max_niveles', 15)
-        
-        soportes_validos = soportes_validos[:max_niveles]
-        resistencias_validas = resistencias_validas[:max_niveles]
-        
-        resultado = {
-            'soportes': soportes_validos,
-            'resistencias': resistencias_validas
-        }
-        
-        # Guardar en caché
-        self._cache_niveles[cache_key] = resultado
-        self._cache_timestamp[cache_key] = time.time()
-        
-        return resultado
-    
-    def obtener_nivel_mas_cercano(self,
-                                  simbolo: str,
-                                  precio_actual: float,
-                                  tipo: Optional[str] = None,
-                                  timeframe: str = 'H1',
-                                  max_distancia: float = 3.0) -> Optional[Dict]:
-        """
-        Obtiene el nivel más cercano al precio actual.
-        
-        Args:
-            simbolo: Símbolo
-            precio_actual: Precio actual
-            tipo: 'soporte' o 'resistencia' (None = ambos)
-            timeframe: Timeframe
-            max_distancia: Distancia máxima en porcentaje
-        
-        Returns:
-            Nivel más cercano o None
-        """
-        niveles = self.obtener_niveles_validos(simbolo, timeframe=timeframe)
-        
-        return self.detector.encontrar_nivel_cercano(
-            niveles.get('soportes', []) + niveles.get('resistencias', []),
-            precio_actual,
-            tipo,
-            max_distancia
-        )
-    
-    # ============================================================
-    # PERSISTENCIA
-    # ============================================================
-    
-    def _cargar_niveles_desde_almacen(self,
+
+    def _detectar_niveles_ultima_vela(self,
                                       simbolo: str,
-                                      timeframe: str = 'H1') -> Dict[str, List]:
-        """
-        Carga niveles desde almacenamiento filtrando por timeframe.
-        
-        Args:
-            simbolo: Símbolo
-            timeframe: Timeframe
-        
-        Returns:
-            Diccionario con 'soportes' y 'resistencias'
-        """
-        if not self.almacen:
-            return {'soportes': [], 'resistencias': []}
-        
-        try:
-            niveles = self.almacen.obtener_niveles(simbolo)
-            if not niveles:
-                return {'soportes': [], 'resistencias': []}
-            
-            # Filtrar por timeframe
-            for tipo in ['soportes', 'resistencias']:
-                lista = niveles.get(tipo, [])
-                lista_filtrada = []
-                
-                for n in lista:
-                    if n.get('timeframe', 'H1') == timeframe:
-                        # Asegurar campos
-                        if 'hits' not in n:
-                            n['hits'] = 1
-                        if 'fuerza' not in n:
-                            n['fuerza'] = 20
-                        if 'ultima_fecha' not in n:
-                            n['ultima_fecha'] = datetime.now(timezone.utc).isoformat()
-                        lista_filtrada.append(n)
-                
-                niveles[tipo] = lista_filtrada
-            
-            return niveles
-            
-        except Exception as e:
-            self.logger.warning(f"Error cargando niveles de {simbolo}: {e}")
-            return {'soportes': [], 'resistencias': []}
-    
-    def _actualizar_nivel(self,
-                          simbolo: str,
-                          nivel: Dict,
-                          timeframe: str = 'H1'):
-        """
-        Actualiza un nivel en el historial.
-        
-        Args:
-            simbolo: Símbolo
-            nivel: Datos del nivel
-            timeframe: Timeframe
-        """
-        if not self.almacen:
-            return
-        
-        try:
-            # Buscar nivel existente
-            nivel_existente = self._buscar_nivel(
-                simbolo, nivel['precio'], nivel['tipo'], timeframe
-            )
-            
-            ahora = datetime.now(timezone.utc)
-            
-            if nivel_existente:
-                # Actualizar
-                nivel_existente['hits'] = nivel_existente.get('hits', 0) + nivel.get('hits', 1)
-                nivel_existente['fuerza'] = min(100, nivel_existente.get('fuerza', 0) + nivel.get('fuerza', 0))
-                nivel_existente['ultima_fecha'] = ahora.isoformat()
-                nivel_existente['veces_tocado'] = nivel_existente.get('veces_tocado', 0) + 1
+                                      df: pd.DataFrame,
+                                      precio_actual: float) -> Tuple[List[Dict], List[Dict]]:
+        """Detecta nuevos niveles basados en la última vela."""
+        if len(df) < self.NIVEL_LOOKBACK:
+            return [], []
+
+        ventana = df.iloc[-self.NIVEL_LOOKBACK:]
+        high = ventana['High']
+        low = ventana['Low']
+
+        soportes_nuevos = []
+        resistencias_nuevas = []
+
+        for i in range(5, len(ventana) - 5):
+            if low.iloc[i] == low.iloc[i-5:i+5].min():
+                precio_nivel = low.iloc[i]
+                if abs(precio_actual - precio_nivel) / precio_actual < 0.02:
+                    continue
+                if not self._nivel_existe(simbolo, 'soportes', precio_nivel):
+                    hits = self._contar_toques_nivel(ventana, precio_nivel, 'soporte')
+                    if hits >= self.NIVEL_MIN_HITS:
+                        soportes_nuevos.append({
+                            'precio': precio_nivel,
+                            'hits': hits,
+                            'fecha_deteccion': ventana.index[i],
+                            'fecha_ultimo_toque': ventana.index[-1],
+                            'tipo': 'soporte'
+                        })
+
+            if high.iloc[i] == high.iloc[i-5:i+5].max():
+                precio_nivel = high.iloc[i]
+                if abs(precio_actual - precio_nivel) / precio_actual < 0.02:
+                    continue
+                if not self._nivel_existe(simbolo, 'resistencias', precio_nivel):
+                    hits = self._contar_toques_nivel(ventana, precio_nivel, 'resistencia')
+                    if hits >= self.NIVEL_MIN_HITS:
+                        resistencias_nuevas.append({
+                            'precio': precio_nivel,
+                            'hits': hits,
+                            'fecha_deteccion': ventana.index[i],
+                            'fecha_ultimo_toque': ventana.index[-1],
+                            'tipo': 'resistencia'
+                        })
+
+        return soportes_nuevos, resistencias_nuevas
+
+    def _contar_toques_nivel(self, df: pd.DataFrame, precio_nivel: float, tipo: str) -> int:
+        hits = 0
+        tolerancia = self.NIVEL_TOLERANCIA_PCT * precio_nivel
+        for i in range(len(df)):
+            if tipo == 'soporte':
+                if abs(df['Low'].iloc[i] - precio_nivel) <= tolerancia:
+                    hits += 1
             else:
-                # Crear nuevo
-                nivel['fecha_creacion'] = ahora.isoformat()
-                nivel['ultima_fecha'] = ahora.isoformat()
-                nivel['veces_tocado'] = 1
-                nivel['timeframe'] = timeframe
-            
-            # Guardar todos los niveles del símbolo
-            self._guardar_niveles(simbolo)
-            
-        except Exception as e:
-            self.logger.warning(f"Error actualizando nivel para {simbolo}: {e}")
-    
-    def _guardar_niveles(self, simbolo: str):
-        """
-        Guarda todos los niveles de un símbolo en almacenamiento.
-        
-        Args:
-            simbolo: Símbolo
-        """
-        if not self.almacen:
-            return
-        
-        try:
-            # Obtener todos los niveles del símbolo (todos los timeframes)
-            niveles = self._obtener_todos_los_timeframes(simbolo)
-            
-            self.almacen.guardar_niveles(
-                simbolo,
-                niveles.get('soportes', []),
-                niveles.get('resistencias', [])
-            )
-            
-        except Exception as e:
-            self.logger.warning(f"Error guardando niveles para {simbolo}: {e}")
-    
-    def _obtener_todos_los_timeframes(self, simbolo: str) -> Dict[str, List]:
-        """
-        Obtiene todos los niveles de todos los timeframes.
-        
-        Args:
-            simbolo: Símbolo
-        
-        Returns:
-            Diccionario con 'soportes' y 'resistencias'
-        """
-        if not self.almacen:
-            return {'soportes': [], 'resistencias': []}
-        
-        try:
-            return self.almacen.obtener_niveles(simbolo) or {'soportes': [], 'resistencias': []}
-        except Exception:
-            return {'soportes': [], 'resistencias': []}
-    
-    def _buscar_nivel(self,
-                      simbolo: str,
-                      precio: float,
-                      tipo: str,
-                      timeframe: str = 'H1') -> Optional[Dict]:
-        """
-        Busca un nivel en el historial.
-        
-        Args:
-            simbolo: Símbolo
-            precio: Precio del nivel
-            tipo: 'soporte' o 'resistencia'
-            timeframe: Timeframe
-        
-        Returns:
-            Datos del nivel o None
-        """
-        niveles = self._cargar_niveles_desde_almacen(simbolo, timeframe)
-        lista = niveles.get(f'{tipo}s', [])
-        config = self.CONFIG_POR_TIMEFRAME.get(timeframe, self.CONFIG_POR_TIMEFRAME['H1'])
-        distancia = config.get('distancia_agrupacion', 0.002)
-        
-        for nivel in lista:
-            if abs(nivel.get('precio', 0) - precio) / max(precio, 0.0001) < distancia:
-                return nivel
-        
-        return None
-    
-    def _invalidar_cache(self, simbolo: str, timeframe: Optional[str] = None):
-        """
-        Invalida la caché para un símbolo.
-        
-        Args:
-            simbolo: Símbolo
-            timeframe: Timeframe (None = todos)
-        """
-        keys_to_remove = []
-        for key in self._cache_niveles.keys():
-            if key.startswith(simbolo):
-                if timeframe is None or key.endswith(timeframe):
-                    keys_to_remove.append(key)
-        
-        for key in keys_to_remove:
-            del self._cache_niveles[key]
-            if key in self._cache_timestamp:
-                del self._cache_timestamp[key]
-    
+                if abs(df['High'].iloc[i] - precio_nivel) <= tolerancia:
+                    hits += 1
+        return hits
+
     # ============================================================
-    # MANTENIMIENTO
+    # ACUMULACIÓN DE NIVELES
     # ============================================================
-    
-    def limpiar_niveles_antiguos(self,
-                                 dias: Optional[int] = None,
-                                 timeframe: Optional[str] = None):
-        """
-        Limpia niveles antiguos de todos los símbolos.
-        
-        Args:
-            dias: Días de antigüedad máxima
-            timeframe: Timeframe específico (None = todos)
-        """
-        if dias is None:
-            dias = self.CONFIG_POR_TIMEFRAME.get(
-                timeframe or 'H1', {}
-            ).get('dias_antiguedad_max', 10)
-        
-        fecha_limite = datetime.now(timezone.utc) - timedelta(days=dias)
-        
-        if not self.almacen:
-            return
-        
-        try:
-            simbolos = self._obtener_todos_simbolos()
-            if not simbolos:
-                return
-            
-            limpiados = 0
-            
-            for simbolo in simbolos:
-                niveles = self._obtener_todos_los_timeframes(simbolo)
-                cambios = False
+
+    def _acumular_nivel(self, simbolo: str, tipo: str, precio: float, hits: int = 1):
+        nivel_existente = None
+        tolerancia = self.NIVEL_TOLERANCIA_PCT * precio
+        for nivel in self._niveles_memoria[simbolo][tipo]:
+            if abs(nivel['precio'] - precio) <= tolerancia:
+                nivel_existente = nivel
+                break
+        if nivel_existente:
+            nivel_existente['hits'] += hits
+            nivel_existente['fecha_ultimo_toque'] = datetime.now(timezone.utc)
+            if nivel_existente['hits'] >= 5:
+                nivel_existente['fuerza'] = 'FUERTE'
+            elif nivel_existente['hits'] >= 3:
+                nivel_existente['fuerza'] = 'MEDIO'
+            else:
+                nivel_existente['fuerza'] = 'DEBIL'
+        else:
+            nuevo_nivel = {
+                'precio': precio,
+                'hits': hits,
+                'fecha_deteccion': datetime.now(timezone.utc),
+                'fecha_ultimo_toque': datetime.now(timezone.utc),
+                'tipo': tipo,
+                'fuerza': 'DEBIL' if hits < 3 else 'MEDIO' if hits < 5 else 'FUERTE'
+            }
+            self._niveles_memoria[simbolo][tipo].append(nuevo_nivel)
+
+    def _nivel_existe(self, simbolo: str, tipo: str, precio: float) -> bool:
+        tolerancia = self.NIVEL_TOLERANCIA_PCT * precio
+        for nivel in self._niveles_memoria[simbolo][tipo]:
+            if abs(nivel['precio'] - precio) <= tolerancia:
+                return True
+        return False
+
+    # ============================================================
+    # LIMPIEZA DE NIVELES ANTIGUOS (CORREGIDO)
+    # ============================================================
+
+    def _limpiar_niveles_antiguos(self, simbolo: str):
+        """Limpia niveles antiguos con decaimiento progresivo."""
+        ahora = datetime.now(timezone.utc)
+        max_edad = timedelta(days=self.NIVEL_MAX_EDAD_DIAS)
+
+        for tipo in ['soportes', 'resistencias']:
+            niveles = self._niveles_memoria[simbolo][tipo]
+            niveles_filtrados = []
+
+            for nivel in niveles:
+                fecha_ultimo_toque = nivel.get('fecha_ultimo_toque', nivel.get('fecha_deteccion'))
                 
-                for tipo in ['soportes', 'resistencias']:
-                    lista = niveles.get(tipo, [])
-                    lista_filtrada = []
-                    
-                    for nivel in lista:
-                        # Filtrar por timeframe
-                        if timeframe is not None and nivel.get('timeframe', 'H1') != timeframe:
-                            lista_filtrada.append(nivel)
-                            continue
-                        
-                        try:
-                            ultima_fecha_str = nivel.get('ultima_fecha')
-                            if ultima_fecha_str:
-                                ultima_fecha = datetime.fromisoformat(ultima_fecha_str)
-                                if ultima_fecha.tzinfo is None:
-                                    ultima_fecha = ultima_fecha.replace(tzinfo=timezone.utc)
-                                
-                                if ultima_fecha > fecha_limite:
-                                    lista_filtrada.append(nivel)
-                                else:
-                                    cambios = True
-                                    limpiados += 1
-                            else:
-                                lista_filtrada.append(nivel)
-                        except Exception:
-                            lista_filtrada.append(nivel)
-                    
-                    niveles[tipo] = lista_filtrada
+                # ✅ CORREGIDO: Convertir a offset-aware si es offset-naive
+                if isinstance(fecha_ultimo_toque, str):
+                    try:
+                        fecha_ultimo_toque = datetime.fromisoformat(fecha_ultimo_toque)
+                    except:
+                        fecha_ultimo_toque = ahora - timedelta(days=1)
                 
-                if cambios:
-                    self.almacen.guardar_niveles(
-                        simbolo,
-                        niveles.get('soportes', []),
-                        niveles.get('resistencias', [])
-                    )
-                    self._invalidar_cache(simbolo)
-            
-            if limpiados > 0:
-                self.logger.info(f"🧹 {limpiados} niveles antiguos limpiados")
-            
-        except Exception as e:
-            self.logger.error(f"Error limpiando niveles antiguos: {e}")
-    
-    def _obtener_todos_simbolos(self) -> List[str]:
-        """Obtiene todos los símbolos con niveles guardados."""
-        if not self.almacen:
-            return []
-        
-        try:
-            if hasattr(self.almacen, 'obtener_todos_simbolos'):
-                return self.almacen.obtener_todos_simbolos()
-            return []
-        except Exception:
-            return []
-    
+                # ✅ Asegurar que tenga zona horaria UTC
+                if fecha_ultimo_toque.tzinfo is None:
+                    fecha_ultimo_toque = fecha_ultimo_toque.replace(tzinfo=timezone.utc)
+
+                edad = (ahora - fecha_ultimo_toque).days
+
+                # ✅ Decaimiento por edad
+                if edad > self.NIVEL_MAX_EDAD_DIAS:
+                    continue
+                elif edad > self.NIVEL_MAX_EDAD_DIAS // 2:
+                    nivel['hits'] = max(1, nivel['hits'] - self.NIVEL_DECAY_HITS)
+                    if nivel['hits'] < self.NIVEL_MIN_HITS:
+                        continue
+
+                niveles_filtrados.append(nivel)
+
+            self._niveles_memoria[simbolo][tipo] = niveles_filtrados
+
     # ============================================================
-    # ESTADÍSTICAS
+    # MÉTODOS DE CONSULTA
     # ============================================================
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Obtiene estadísticas del tracker."""
-        total_niveles = 0
-        for cache in self._cache_niveles.values():
-            total_niveles += len(cache.get('soportes', [])) + len(cache.get('resistencias', []))
-        
+
+    def obtener_niveles(self, simbolo: str) -> Dict[str, List[Dict]]:
+        """Obtiene niveles."""
+        if simbolo not in self._niveles_memoria:
+            return {'soportes': [], 'resistencias': []}
+        self._limpiar_niveles_antiguos(simbolo)
         return {
-            'timeframe_default': self.timeframe_default,
-            'cache_size': len(self._cache_niveles),
-            'total_niveles_cached': total_niveles,
-            'config_timeframes': len(self.CONFIG_POR_TIMEFRAME),
-            'modo_backtest': self.modo_backtest,
+            'soportes': sorted(self._niveles_memoria[simbolo]['soportes'], key=lambda x: x['precio']),
+            'resistencias': sorted(self._niveles_memoria[simbolo]['resistencias'], key=lambda x: x['precio'], reverse=True)
         }
     
-    def print_stats(self):
-        """Imprime estadísticas en formato legible."""
-        stats = self.get_stats()
-        self.logger.info("📊 ESTADÍSTICAS DE NIVELTRACKER")
-        self.logger.info(f"   Timeframe principal: {stats['timeframe_default']}")
-        self.logger.info(f"   Caché size: {stats['cache_size']}")
-        self.logger.info(f"   Total niveles en caché: {stats['total_niveles_cached']}")
-        self.logger.info(f"   Timeframes configurados: {stats['config_timeframes']}")
+    def obtener_nivel_fuerte(self, simbolo: str, direccion: str) -> Optional[float]:
+        niveles = self.obtener_niveles(simbolo)
+        if direccion == 'COMPRA':
+            for soporte in niveles['soportes']:
+                if soporte.get('fuerza') == 'FUERTE':
+                    return soporte['precio']
+        else:
+            for resistencia in niveles['resistencias']:
+                if resistencia.get('fuerza') == 'FUERTE':
+                    return resistencia['precio']
+        return None
+
+    def limpiar_memoria(self):
+        self._niveles_memoria.clear()
+        self.logger.info("🧹 Memoria de niveles limpiada")
+
+    def get_stats(self, simbolo: Optional[str] = None) -> Dict[str, Any]:
+        if simbolo:
+            if simbolo not in self._niveles_memoria:
+                return {}
+            return {
+                'simbolo': simbolo,
+                'soportes': len(self._niveles_memoria[simbolo]['soportes']),
+                'resistencias': len(self._niveles_memoria[simbolo]['resistencias']),
+                'soportes_fuertes': sum(1 for n in self._niveles_memoria[simbolo]['soportes'] if n.get('fuerza') == 'FUERTE'),
+                'resistencias_fuertes': sum(1 for n in self._niveles_memoria[simbolo]['resistencias'] if n.get('fuerza') == 'FUERTE'),
+            }
+        else:
+            return {simbolo: self.get_stats(simbolo) for simbolo in self._niveles_memoria}
 
 
 # ============================================================
@@ -729,82 +399,9 @@ class NivelTracker:
 
 def create_nivel_tracker(almacen: Optional[Any] = None,
                          config: Optional[Any] = None,
-                         detector: Optional[DetectorNiveles] = None,
-                         modo_backtest: bool = False,
-                         timeframe_default: str = 'H1') -> NivelTracker:
-    """
-    Crea una instancia de NivelTracker.
-    
-    Args:
-        almacen: Almacenamiento SQLite
-        config: Configuración
-        detector: Detector de niveles (opcional)
-        modo_backtest: Modo backtest
-        timeframe_default: Timeframe por defecto
-    
-    Returns:
-        NivelTracker
-    """
+                         modo_backtest: bool = False) -> NivelTracker:
     return NivelTracker(
         almacen=almacen,
         config=config,
-        detector=detector,
-        modo_backtest=modo_backtest,
-        timeframe_default=timeframe_default
+        modo_backtest=modo_backtest
     )
-
-
-# ============================================================
-# TEST
-# ============================================================
-
-if __name__ == "__main__":
-    # Prueba rápida con datos mock
-    import pandas as pd
-    import numpy as np
-    
-    # Crear datos mock
-    np.random.seed(42)
-    n = 200
-    dates = pd.date_range('2024-01-01', periods=n, freq='H')
-    df = pd.DataFrame({
-        'Open': np.random.randn(n) * 10 + 100,
-        'High': np.random.randn(n) * 10 + 102,
-        'Low': np.random.randn(n) * 10 + 98,
-        'Close': np.random.randn(n) * 10 + 100,
-        'Volume': np.random.randint(100, 1000, n)
-    }, index=dates)
-    df['Close'] = df['Close'].cumsum() / 10 + 100
-    df['High'] = df['Close'] + np.abs(np.random.randn(n) * 2)
-    df['Low'] = df['Close'] - np.abs(np.random.randn(n) * 2)
-    df['Open'] = df['Close'] + np.random.randn(n) * 0.5
-    
-    # Crear tracker sin almacenamiento
-    tracker = NivelTracker(modo_backtest=True)
-    
-    # Detectar niveles
-    resultado = tracker.detectar_y_actualizar_niveles(
-        simbolo='EURUSD',
-        df=df,
-        precio_actual=df['Close'].iloc[-1],
-        timeframe='H1'
-    )
-    
-    print(f"Soportes: {len(resultado.get('soportes', []))}")
-    for s in resultado.get('soportes', [])[:3]:
-        print(f"  Soporte: {s.get('precio', 0):.2f} (hits: {s.get('hits', 0)})")
-    
-    print(f"Resistencias: {len(resultado.get('resistencias', []))}")
-    for r in resultado.get('resistencias', [])[:3]:
-        print(f"  Resistencia: {r.get('precio', 0):.2f} (hits: {r.get('hits', 0)})")
-    
-    # Probar nivel más cercano
-    nivel = tracker.obtener_nivel_mas_cercano(
-        simbolo='EURUSD',
-        precio_actual=df['Close'].iloc[-1],
-        max_distancia=5.0
-    )
-    if nivel:
-        print(f"Nivel más cercano: {nivel.get('tipo')} a {nivel.get('precio', 0):.2f}")
-    
-    print("\n✅ Prueba completada")

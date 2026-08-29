@@ -69,22 +69,26 @@ class CacheUnificado:
     }
     
     def __init__(self,
-                 max_size: int = 500,
-                 default_ttl: int = 300,
-                 ttls: Optional[Dict[Union[int, str], int]] = None,
-                 persist_dir: Optional[Path] = None,
-                 persist_interval: int = 60,
-                 modo_backtest: bool = False):
+             max_size: int = 500,
+             default_ttl: int = 300,
+             ttls: Optional[Dict[Union[int, str], int]] = None,
+             persist_dir: Optional[Path] = None,
+             persist_interval: int = 60,
+             modo_backtest: bool = False,
+             almacen: Optional[Any] = None):
         self.max_size = max_size
         self.default_ttl = default_ttl
         self.persist_dir = Path(persist_dir) if persist_dir else Path("data/cache")
         self.persist_dir.mkdir(parents=True, exist_ok=True)
         self.persist_interval = persist_interval
         self.modo_backtest = modo_backtest
-        
+        self.almacen = almacen
         self.ttls = self.TTL_POR_DEFECTO.copy()
         if ttls:
             self.ttls.update(ttls)
+        
+        # ✅ DEFINIR self.logger
+        self.logger = logging.getLogger('BotTrading.Cache')
         
         self._cache: Dict[Tuple, CacheEntry] = {}
         self._lock = threading.RLock()
@@ -106,11 +110,11 @@ class CacheUnificado:
         self._cargar_cache_persistente()
         self._iniciar_limpieza_automatica()
         
-        logger.info(f"📦 CacheUnificado V9.0 inicializado")
-        logger.info(f"   Max size: {max_size}")
-        logger.info(f"   Default TTL: {default_ttl}s")
-        logger.info(f"   Persist dir: {self.persist_dir}")
-    
+        self.logger.info(f"📦 CacheUnificado V9.0 inicializado")
+        self.logger.info(f"   Max size: {max_size}")
+        self.logger.info(f"   Default TTL: {default_ttl}s")
+        self.logger.info(f"   Persist dir: {self.persist_dir}")
+
     # ============================================================
     # MÉTODOS PRINCIPALES
     # ============================================================
@@ -144,6 +148,9 @@ class CacheUnificado:
         if isinstance(key, str):
             key = (key,)
         
+        # ✅ LOG DE DEPURACIÓN
+        self.logger.info(f"📦 Cache.set: key={key}, data type={type(data)}")
+        
         now = time.time()
         if ttl is None:
             ttl = self._obtener_ttl(key)
@@ -164,6 +171,13 @@ class CacheUnificado:
             self._agregar_indices(key)
             self._stats['total_entries'] += 1
             self._cleanup_if_needed()
+            
+            # ✅ PERSISTIR EN SQLITE SI ES DATOS DE MERCADO
+            if len(key) == 3 and isinstance(key[1], int):
+                simbolo = key[0]
+                timeframe = key[1]
+                self._guardar_en_sqlite(simbolo, timeframe, data)
+            
             self._guardar_cache_persistente()
     
     def get_or_compute(self, key: Union[Tuple, str],
@@ -188,25 +202,107 @@ class CacheUnificado:
     # MÉTODOS DE DATOS (DataCache)
     # ============================================================
     
-    def get_datos(self, simbolo: str, timeframe: int, n_velas: int,
-                  fetch_func: Optional[Callable] = None,
-                  force: bool = False) -> Optional[pd.DataFrame]:
-        key = (simbolo, timeframe, n_velas)
-        if not force:
-            resultado = self.get(key)
-            if resultado is not None:
-                return resultado.copy() if isinstance(resultado, pd.DataFrame) else resultado
+    def get_datos(self, simbolo: str, timeframe: int, n_velas: int, fetch_func) -> Optional[Any]:
+        """
+        Obtiene datos de mercado con caché.
+        - Primero intenta desde la caché en memoria.
+        - Luego desde SQLite.
+        - Finalmente desde MT5 (usando la última fecha de SQLite).
+        """
+        cache_key = (simbolo, timeframe, n_velas)
         
-        if fetch_func:
+        # 1. Intentar desde la caché en memoria
+        if cache_key in self._cache:
+            entry = self._cache[cache_key]
+            if not entry.is_expired(time.time()):
+                self.logger.debug(f"📦 Cache hit: {simbolo} TF{timeframe}")
+                return entry.data
+        
+        # 2. Intentar desde SQLite
+        df_sqlite = None
+        if self.almacen:
             try:
-                df = fetch_func(simbolo, n_velas, timeframe)
-                if df is not None and not df.empty:
-                    self.set(key, df.copy())
-                    return df.copy()
+                df_sqlite = self.almacen.obtener_datos_historicos(simbolo, timeframe)
+                if df_sqlite is not None and not df_sqlite.empty:
+                    self.logger.info(f"✅ {simbolo} TF{timeframe}: Datos cargados desde SQLite ({len(df_sqlite)} velas)")
+                    self.set(cache_key, df_sqlite, ttl=self.ttls.get(timeframe, 300))
+                    return df_sqlite
             except Exception as e:
-                logger.error(f"❌ Error descargando {simbolo}: {e}")
+                self.logger.warning(f"⚠️ {simbolo} TF{timeframe}: Error cargando desde SQLite: {e}")
         
-        return None
+        # 3. Si no hay datos, obtener de MT5
+        self.logger.info(f"📥 {simbolo} TF{timeframe}: Descargando de MT5...")
+        data = fetch_func(simbolo, n_velas, timeframe)
+        
+        if data is not None:
+            self.set(cache_key, data, ttl=self.ttls.get(timeframe, 300))
+            self.logger.info(f"✅ {simbolo} TF{timeframe}: Datos guardados en caché ({len(data)} velas)")
+        else:
+            self.logger.warning(f"⚠️ {simbolo} TF{timeframe}: No se pudieron obtener datos de MT5")
+        
+        return data
+
+    def get(self, key: Union[Tuple, str], ttl: Optional[int] = None) -> Optional[Any]:
+        if isinstance(key, str):
+            key = (key,)
+        
+        # ✅ LOG DE DEPURACIÓN
+        self.logger.info(f"📦 Cache.get: key={key}")
+        
+        now = time.time()
+        with self._lock:
+            if key in self._cache:
+                entry = self._cache[key]
+                ttl_efectivo = ttl or entry.ttl
+                if not entry.is_expired(now):
+                    entry.touch()
+                    self._stats['hits'] += 1
+                    return entry.data
+                else:
+                    self._stats['expired'] += 1
+                    del self._cache[key]
+                    self._remover_indices(key)
+                    return None
+            
+            self._stats['misses'] += 1
+            return None
+
+    def _guardar_en_sqlite(self, simbolo: str, timeframe: int, df: pd.DataFrame):
+        """Guarda datos históricos en SQLite."""
+        if self.almacen is None:
+            return
+        
+        try:
+            # El método guardar_datos_historicos existe en almacenamiento_sqlite.py
+            self.almacen.guardar_datos_historicos(simbolo, timeframe, df)
+        except Exception as e:
+            logger.warning(f"⚠️ Error guardando datos en SQLite para {simbolo} TF{timeframe}: {e}")
+
+    def cargar_desde_sqlite(self, simbolo: str, timeframe: int) -> Optional[pd.DataFrame]:
+        """
+        Intenta cargar datos desde SQLite.
+        """
+        if self.almacen is None:
+            return None
+        
+        try:
+            # Obtener datos históricos desde SQLite
+            datos = self.almacen.obtener_datos_historicos(simbolo, timeframe)
+            if datos is None or len(datos) == 0:
+                return None
+            
+            import pandas as pd
+            df = pd.DataFrame(datos)
+            df['time'] = pd.to_datetime(df['time'], unit='s')
+            df.set_index('time', inplace=True)
+            df.rename(columns={
+                'open': 'Open', 'high': 'High', 'low': 'Low',
+                'close': 'Close', 'tick_volume': 'Volume'
+            }, inplace=True)
+            return df
+        except Exception as e:
+            logger.warning(f"⚠️ Error cargando desde SQLite: {e}")
+            return None
     
     def get_datos_multi(self, simbolo: str, timeframes: List[int],
                         n_velas: Optional[int] = None,
@@ -467,7 +563,8 @@ class CacheUnificado:
 
 def create_cache_unificado(config: Optional[Any] = None,
                            persist_dir: Optional[Path] = None,
-                           modo_backtest: bool = False) -> CacheUnificado:
+                           modo_backtest: bool = False,
+                           almacen: Optional[Any] = None) -> CacheUnificado:
     max_size = getattr(config, 'CACHE_MAX_SIZE', 500) if config else 500
     default_ttl = getattr(config, 'CACHE_DEFAULT_TTL', 300) if config else 300
     ttls = getattr(config, 'CACHE_TTLS', None) if config else None
@@ -479,7 +576,8 @@ def create_cache_unificado(config: Optional[Any] = None,
         ttls=ttls,
         persist_dir=persist_dir,
         persist_interval=persist_interval,
-        modo_backtest=modo_backtest
+        modo_backtest=modo_backtest,
+        almacen=almacen
     )
 
 

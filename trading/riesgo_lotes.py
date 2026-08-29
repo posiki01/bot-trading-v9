@@ -1,380 +1,358 @@
 #!/usr/bin/env python3
 """
-trading/riesgo_lotes.py (V9.0)
-Cálculo de lotes optimizado para trading.
-RESPONSABILIDAD: Solo calcular lotes, no gestionar riesgo.
+trading/riesgo_lotes.py (V9.35 - CORREGIDO)
+Cálculo de lotes con límites por activo y capital disponible.
 """
 
 import logging
-from typing import Optional, Dict, Any
-from decimal import Decimal
+from typing import Dict, Any, Optional, Tuple
+import math
+
+from config.umbrales import Umbrales
 
 logger = logging.getLogger('BotTrading.RiesgoLotes')
 
 
 class CalculadorLotes:
     """
-    Calcula el tamaño de posición óptimo.
-    V9.0 - INDEPENDIENTE.
+    Calculador de lotes con límites por activo y verificación de margen.
+    V9.35 - CORREGIDO: Límites estrictos por activo.
     """
     
-    def __init__(self, config: Optional[Any] = None):
-        """
-        Inicializa el calculador de lotes.
-        
-        Args:
-            config: Configuración
-        """
+    def __init__(self, config: Optional[Any] = None, modo_backtest: bool = False):
         self.config = config
+        self.modo_backtest = modo_backtest
         self.logger = logging.getLogger('BotTrading.RiesgoLotes')
         
-        # Cargar configuración
-        self._cargar_configuracion()
+        # Cargar límites
+        self._cargar_limites()
     
-    def _cargar_configuracion(self):
-        """Carga configuración desde Config."""
-        if self.config:
-            self.max_lote_absoluto = getattr(self.config, 'MAX_LOTE_ABSOLUTO', 0.05)
-            self.min_lote_absoluto = getattr(self.config, 'MIN_LOTE_ABSOLUTO', 0.01)
-            self.max_risk_per_trade = getattr(self.config, 'MAX_RISK_PER_TRADE_PCT', 0.01)
-        else:
-            self.max_lote_absoluto = 0.05
-            self.min_lote_absoluto = 0.01
-            self.max_risk_per_trade = 0.01
+    def _cargar_limites(self):
+        """Carga límites desde Umbrales."""
+        self.lotes_max = getattr(Umbrales, 'LOTES_MAX_POR_ACTIVO', {})
+        self.lotes_min = getattr(Umbrales, 'LOTES_MIN_POR_ACTIVO', {})
+        self.riesgo_max = getattr(Umbrales, 'RIESGO_MAX_POR_OPERACION', {})
+        
+        # Defaults
+        self.lotes_max_default = 0.10
+        self.lotes_min_default = 0.01
+        self.riesgo_max_default = 0.01
     
-    # ============================================================
-    # MÉTODO PRINCIPAL
-    # ============================================================
-    
-    def calcular_lotes(self,
-                       entrada: float,
-                       stop_loss: float,
-                       probabilidad: float,
-                       simbolo: str,
-                       capital: float,
-                       tick_value: float = 0.01,
-                       tick_size: float = 0.00001,
-                       point: float = 0.00001,
-                       atr: float = 0.001,
-                       atr_medio: float = 0.001,
-                       spread: float = 0.0,
-                       margin_level: Optional[float] = None,
-                       factor_volatilidad: float = 1.0,
-                       factor_conviccion: float = 1.0) -> float:
+    def calcular(self,
+                 simbolo: str,
+                 entry_price: float,
+                 stop_loss: float,
+                 capital: float,
+                 pip_size: float,
+                 tick_value: float,
+                 tick_size: float,
+                 point: float,
+                 probabilidad: float = 50.0,
+                 riesgo_personalizado: Optional[float] = None) -> Tuple[float, float, str]:
         """
-        Calcula el tamaño de posición óptimo.
+        Calcula lotes óptimos con límites por activo.
         
         Args:
-            entrada: Precio de entrada
-            stop_loss: Precio de stop loss
-            probabilidad: Probabilidad de éxito (0-100)
             simbolo: Símbolo
+            entry_price: Precio de entrada
+            stop_loss: Precio de stop loss
             capital: Capital disponible
+            pip_size: Tamaño del pip
             tick_value: Valor del tick
             tick_size: Tamaño del tick
-            point: Punto del símbolo
-            atr: ATR actual
-            atr_medio: ATR medio (para ajuste)
-            spread: Spread actual
-            margin_level: Nivel de margen
-            factor_volatilidad: Factor de volatilidad
-            factor_conviccion: Factor de convicción
-        
-        Returns:
-            Lotes calculados
-        """
-        # 1. Validaciones básicas
-        if capital <= 0 or entrada <= 0 or stop_loss <= 0:
-            return 0.0
-        
-        distancia = abs(entrada - stop_loss)
-        if distancia == 0:
-            return 0.0
-        
-        # 2. Calcular pip value y distancia en pips
-        pip_size = self._obtener_pip_size(simbolo)
-        pip_val = self._obtener_pip_value(simbolo)
-        
-        distancia_en_pips = distancia / pip_size if pip_size > 0 else 0
-        if distancia_en_pips <= 0:
-            return 0.0
-        
-        # 3. Calcular riesgo máximo en USD
-        riesgo_max_usd = self._calcular_riesgo_maximo(
-            capital=capital,
-            probabilidad=probabilidad,
-            factor_volatilidad=factor_volatilidad,
-            factor_conviccion=factor_conviccion
-        )
-        
-        # 4. Calcular lotes base
-        pip_value_por_lote = pip_val * 0.01  # Valor de pip por 0.01 lotes
-        if pip_value_por_lote <= 0:
-            return 0.0
-        
-        lotes_teoricos = riesgo_max_usd / (distancia_en_pips * pip_value_por_lote)
-        
-        # 5. Aplicar ajustes
-        lotes_ajustados = self._aplicar_ajustes(
-            lotes=lotes_teoricos,
-            simbolo=simbolo,
-            atr=atr,
-            atr_medio=atr_medio,
-            spread=spread,
-            margin_level=margin_level,
-            capital=capital
-        )
-        
-        # 6. Redondear y limitar
-        lotes_finales = self._redondear_y_limitar(lotes_ajustados, simbolo)
-        
-        self.logger.debug(
-            f"📊 Lotes calculados: {lotes_finales:.3f} "
-            f"(base: {lotes_teoricos:.3f}, ajustado: {lotes_ajustados:.3f})"
-        )
-        
-        return lotes_finales
-    
-    # ============================================================
-    # CÁLCULO DE RIESGO MÁXIMO
-    # ============================================================
-    
-    def _calcular_riesgo_maximo(self,
-                                capital: float,
-                                probabilidad: float,
-                                factor_volatilidad: float = 1.0,
-                                factor_conviccion: float = 1.0) -> float:
-        """
-        Calcula el riesgo máximo en USD.
-        
-        Args:
-            capital: Capital disponible
+            point: Tamaño del punto
             probabilidad: Probabilidad de éxito (0-100)
-            factor_volatilidad: Factor de volatilidad
-            factor_conviccion: Factor de convicción
+            riesgo_personalizado: Riesgo personalizado (opcional)
         
         Returns:
-            Riesgo máximo en USD
-        """
-        # 1. Riesgo base por capital
-        riesgo_base = capital * self.max_risk_per_trade
-        
-        # 2. Ajuste por probabilidad (Kelly Criterion simplificado)
-        if probabilidad > 80:
-            factor_prob = 1.2
-        elif probabilidad > 65:
-            factor_prob = 1.0
-        elif probabilidad > 50:
-            factor_prob = 0.8
-        else:
-            factor_prob = 0.5
-        
-        # 3. Riesgo final
-        riesgo_max = riesgo_base * factor_prob * factor_volatilidad * factor_conviccion
-        
-        # 4. Limitar
-        riesgo_max = max(riesgo_max, capital * 0.001)  # Mínimo 0.1%
-        riesgo_max = min(riesgo_max, capital * 0.025)  # Máximo 2.5%
-        
-        return riesgo_max
-    
-    # ============================================================
-    # AJUSTES
-    # ============================================================
-    
-    def _aplicar_ajustes(self,
-                         lotes: float,
-                         simbolo: str,
-                         atr: float,
-                         atr_medio: float,
-                         spread: float,
-                         margin_level: Optional[float],
-                         capital: float) -> float:
-        """
-        Aplica ajustes al tamaño de posición.
-        
-        Args:
-            lotes: Lotes base
-            simbolo: Símbolo
-            atr: ATR actual
-            atr_medio: ATR medio
-            spread: Spread actual
-            margin_level: Nivel de margen
-            capital: Capital disponible
-        
-        Returns:
-            Lotes ajustados
-        """
-        lotes_ajustados = lotes
-        
-        # 1. Ajuste por ATR (volatilidad)
-        if atr > 0 and atr_medio > 0:
-            atr_ratio = atr / atr_medio
-            if atr_ratio > 1.5:
-                lotes_ajustados *= 0.7  # Reducir en alta volatilidad
-            elif atr_ratio > 1.2:
-                lotes_ajustados *= 0.85
-            elif atr_ratio < 0.7:
-                lotes_ajustados *= 1.15  # Aumentar en baja volatilidad
-        
-        # 2. Ajuste por spread
-        if spread > 0:
-            spread_ratio = spread / 0.0001  # Asumiendo spread base
-            if spread_ratio > 2.0:
-                lotes_ajustados *= 0.8
-        
-        # 3. Ajuste por margen
-        if margin_level is not None:
-            if margin_level < 300:
-                lotes_ajustados *= 0.3
-            elif margin_level < 500:
-                lotes_ajustados *= 0.5
-            elif margin_level < 1000:
-                lotes_ajustados *= 0.7
-        
-        # 4. Ajuste por capital (más conservador con capital bajo)
-        if capital < 500:
-            lotes_ajustados *= 0.5
-        elif capital < 1000:
-            lotes_ajustados *= 0.8
-        
-        return max(0.01, lotes_ajustados)
-    
-    # ============================================================
-    # REDONDEO Y LÍMITES
-    # ============================================================
-    
-    def _redondear_y_limitar(self, lotes: float, simbolo: str) -> float:
-        """
-        Redondea y limita los lotes según el tipo de activo.
-        
-        Args:
-            lotes: Lotes a redondear
-            simbolo: Símbolo
-        
-        Returns:
-            Lotes redondeados y limitados
+            (lotes, riesgo_porcentaje, mensaje)
         """
         simbolo_upper = simbolo.upper()
         
-        # Determinar paso y límites según tipo de activo
-        if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
-            paso = 0.1
-            min_lote = 0.1
-            max_lote = min(self.max_lote_absoluto, 10.0)
-        elif any(x in simbolo_upper for x in ['XAU', 'XAG']):
-            paso = 0.01
-            min_lote = 0.01
-            max_lote = self.max_lote_absoluto
-        elif any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
-            paso = 0.01
-            min_lote = 0.01
-            max_lote = self.max_lote_absoluto
+        # ============================================================
+        # 1. VERIFICAR CAPITAL SUFICIENTE
+        # ============================================================
+        if capital <= 0:
+            self.logger.error(f"❌ {simbolo}: Capital insuficiente (${capital:.2f})")
+            return 0.0, 0.0, "Capital insuficiente"
+        
+        if entry_price <= 0 or stop_loss <= 0:
+            self.logger.error(f"❌ {simbolo}: Precios inválidos (entry={entry_price}, sl={stop_loss})")
+            return 0.0, 0.0, "Precios inválidos"
+        
+        # ============================================================
+        # 2. CALCULAR DISTANCIA DEL SL
+        # ============================================================
+        sl_dist = abs(entry_price - stop_loss)
+        
+        if sl_dist <= 0:
+            self.logger.error(f"❌ {simbolo}: SL en precio de entrada")
+            return 0.0, 0.0, "SL en entrada"
+        
+        # Calcular SL en pips
+        if pip_size > 0:
+            sl_pips = sl_dist / pip_size
         else:
-            paso = 0.01
-            min_lote = 0.01
-            max_lote = self.max_lote_absoluto
+            sl_pips = 0
         
-        # Redondear al múltiplo del paso
-        if paso > 0:
-            lotes_redondeados = round(lotes / paso) * paso
+        if sl_pips <= 0:
+            self.logger.warning(f"⚠️ {simbolo}: SL inválido ({sl_pips:.1f} pips)")
+            # Fallback: usar punto
+            if point > 0:
+                sl_pips = sl_dist / point
+            else:
+                sl_pips = 10
+        
+        # ============================================================
+        # 3. OBTENER RIESGO MÁXIMO PERMITIDO
+        # ============================================================
+        if riesgo_personalizado is not None:
+            riesgo_pct = min(riesgo_personalizado, 0.02)  # Máximo 2%
         else:
-            lotes_redondeados = lotes
+            riesgo_pct = self.riesgo_max.get(simbolo_upper, self.riesgo_max_default)
+            
+            # Ajuste por probabilidad
+            if probabilidad > 70:
+                riesgo_pct = riesgo_pct * 1.1
+            elif probabilidad < 40:
+                riesgo_pct = riesgo_pct * 0.7
+            
+            # Ajuste por backtest
+            if self.modo_backtest:
+                riesgo_pct = min(riesgo_pct * 1.2, 0.02)
         
-        # Aplicar límites
-        lotes_redondeados = max(min_lote, min(max_lote, lotes_redondeados))
+        # Limitar riesgo máximo
+        riesgo_pct = min(riesgo_pct, 0.02)  # Máximo 2%
+        riesgo_pct = max(riesgo_pct, 0.001)  # Mínimo 0.1%
         
-        return round(lotes_redondeados, 3)
+        # ============================================================
+        # 4. CALCULAR LOTES POR RIESGO
+        # ============================================================
+        riesgo_dinero = capital * riesgo_pct
+        valor_pip = self._calcular_valor_pip(simbolo, entry_price, tick_value, tick_size, point)
+        
+        if valor_pip <= 0:
+            self.logger.warning(f"⚠️ {simbolo}: Valor pip inválido, usando fallback")
+            valor_pip = 1.0
+        
+        lotes_por_riesgo = riesgo_dinero / (sl_pips * valor_pip)
+        
+        # ============================================================
+        # 5. APLICAR LÍMITES POR ACTIVO
+        # ============================================================
+        lote_min = self.lotes_min.get(simbolo_upper, self.lotes_min_default)
+        lote_max = self.lotes_max.get(simbolo_upper, self.lotes_max_default)
+        
+        # ✅ CORRECCIÓN CRÍTICA: Límite especial para XAUUSD
+        if simbolo_upper == 'XAUUSD':
+            lote_max = min(lote_max, 0.05)  # Máximo 0.05 para oro con capital bajo
+            
+            # Si capital < $1000, reducir aún más
+            if capital < 1000:
+                lote_max = min(lote_max, 0.02)
+        
+        # ✅ Límite especial para BTCUSD
+        if 'BTC' in simbolo_upper:
+            lote_max = min(lote_max, 0.01)
+        
+        # ✅ Límite especial para ETHUSD
+        if 'ETH' in simbolo_upper:
+            lote_max = min(lote_max, 0.02)
+        
+        # Ajustar lotes
+        lotes = max(lote_min, min(lote_max, lotes_por_riesgo))
+        
+        # ✅ Si la cuenta es pequeña, reducir lotes automáticamente
+        if capital < 2000:
+            factor_reduccion = capital / 2000
+            lotes = max(lote_min, lotes * factor_reduccion)
+        
+        # Redondear al paso del broker
+        lotes = self._redondear_lotes(lotes, simbolo)
+        
+        # ============================================================
+        # 6. VERIFICAR MARGEN DISPONIBLE (si está disponible)
+        # ============================================================
+        margen_requerido = self._estimar_margen(simbolo, lotes, entry_price)
+        margen_disponible = capital * 0.8  # Estimación conservadora
+        
+        if margen_requerido > margen_disponible:
+            self.logger.warning(f"⚠️ {simbolo}: Margen insuficiente (req: ${margen_requerido:.2f}, disp: ${margen_disponible:.2f})")
+            # Reducir lotes hasta que el margen sea suficiente
+            while margen_requerido > margen_disponible and lotes > lote_min:
+                lotes = max(lote_min, lotes * 0.8)
+                margen_requerido = self._estimar_margen(simbolo, lotes, entry_price)
+            
+            self.logger.info(f"📊 {simbolo}: Lotes reducidos a {lotes:.3f} por margen")
+        
+        # ============================================================
+        # 7. LOG DE RESULTADO
+        # ============================================================
+        riesgo_final = (lotes * sl_pips * valor_pip) / capital
+        
+        self.logger.info(f"📊 {simbolo}: Lotes calculados:")
+        self.logger.info(f"   Capital: ${capital:.2f}")
+        self.logger.info(f"   Riesgo: {riesgo_pct*100:.2f}% (${riesgo_dinero:.2f})")
+        self.logger.info(f"   SL: {sl_pips:.1f} pips")
+        self.logger.info(f"   Valor pip: ${valor_pip:.2f}")
+        self.logger.info(f"   Lotes: {lotes:.3f} (min: {lote_min}, max: {lote_max})")
+        self.logger.info(f"   Riesgo real: {riesgo_final*100:.2f}%")
+        
+        return lotes, riesgo_final * 100, f"Lotes: {lotes:.3f}"
     
-    # ============================================================
-    # UTILIDADES
-    # ============================================================
+    def _calcular_valor_pip(self,
+                            simbolo: str,
+                            precio: float,
+                            tick_value: float,
+                            tick_size: float,
+                            point: float) -> float:
+        """Calcula el valor de 1 pip en la moneda de la cuenta."""
+        try:
+            simbolo_upper = simbolo.upper()
+            
+            # 1. Usar tick_value del broker si está disponible
+            if tick_value > 0 and tick_size > 0:
+                pip_size = self._obtener_pip_size(simbolo, point)
+                if pip_size > 0:
+                    return tick_value / tick_size * pip_size
+            
+            # 2. Fallback: estimación por tipo de activo
+            if 'JPY' in simbolo_upper:
+                return 1.0 / 100
+            elif 'XAU' in simbolo_upper:
+                return 0.10  # $0.10 por pip para 0.01 lotes
+            elif 'XAG' in simbolo_upper:
+                return 1.0
+            elif any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
+                return 1.0
+            elif any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
+                return 1.0
+            else:
+                return 1.0  # Forex estándar: $1 por pip para 0.01 lotes
+                
+        except Exception as e:
+            self.logger.warning(f"⚠️ Error calculando valor pip para {simbolo}: {e}")
+            return 1.0
     
-    def _obtener_pip_size(self, simbolo: str) -> float:
-        """
-        Obtiene el tamaño de un pip para el símbolo.
-        
-        Args:
-            simbolo: Símbolo
-        
-        Returns:
-            Tamaño del pip
-        """
+    def _obtener_pip_size(self, simbolo: str, point: float) -> float:
+        """Obtiene el tamaño del pip en unidades de precio."""
         simbolo_upper = simbolo.upper()
         
         if 'JPY' in simbolo_upper:
             return 0.01
-        if any(x in simbolo_upper for x in ['XAU', 'XAG']):
-            return 0.10
-        if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
-            return 1.0
-        if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
-            return 1.0
-        return 0.0001
-    
-    def _obtener_pip_value(self, simbolo: str) -> float:
-        """
-        Obtiene el valor de un pip por lote estándar.
-        
-        Args:
-            simbolo: Símbolo
-        
-        Returns:
-            Valor del pip por lote estándar
-        """
-        simbolo_upper = simbolo.upper()
-        
-        if any(x in simbolo_upper for x in ['JPY']):
-            return 10.0  # JPY pairs
-        if any(x in simbolo_upper for x in ['XAU', 'XAG']):
-            return 10.0  # Metals
-        if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
-            return 1.0   # Indices
-        if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
-            return 1.0   # Crypto
-        return 10.0      # Forex standard
-    
-    def _obtener_lote_minimo_por_activo(self, simbolo: str) -> float:
-        """
-        Obtiene el lote mínimo permitido para el tipo de activo.
-        
-        Args:
-            simbolo: Símbolo
-        
-        Returns:
-            Lote mínimo
-        """
-        simbolo_upper = simbolo.upper()
-        
-        if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
+        elif 'XAU' in simbolo_upper:
+            return 0.01
+        elif 'XAG' in simbolo_upper:
             return 0.1
-        if any(x in simbolo_upper for x in ['XAU', 'XAG']):
-            return 0.01
-        if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
-            return 0.01
-        return 0.01
-    
-    def calcular_factor_volatilidad(self, atr: float, precio: float) -> float:
-        """
-        Calcula el factor de volatilidad basado en ATR.
-        
-        Args:
-            atr: ATR actual
-            precio: Precio actual
-        
-        Returns:
-            Factor de volatilidad (0.5-1.5)
-        """
-        if precio <= 0 or atr <= 0:
+        elif any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
             return 1.0
-        
-        atr_pct = (atr / precio) * 100
-        
-        if atr_pct > 1.0:
-            return 0.7
-        elif atr_pct > 0.5:
-            return 0.85
-        elif atr_pct > 0.3:
+        elif any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
             return 1.0
         else:
-            return 1.2
+            return 0.0001
+    
+    def _redondear_lotes(self, lotes: float, simbolo: str) -> float:
+        """Redondea lotes al paso del broker."""
+        # Paso estándar
+        paso = 0.01
+        
+        # Pasos especiales
+        simbolo_upper = simbolo.upper()
+        if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
+            paso = 0.01
+        elif any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
+            paso = 0.01
+        elif 'XAU' in simbolo_upper:
+            paso = 0.01
+        else:
+            paso = 0.01
+        
+        # Redondear al paso
+        lotes_redondeado = round(lotes / paso) * paso
+        
+        # Asegurar mínimo 0.01
+        if lotes_redondeado < 0.01:
+            lotes_redondeado = 0.01
+        
+        return lotes_redondeado
+    
+    def _estimar_margen(self, simbolo: str, lotes: float, precio: float) -> float:
+        """Estima el margen requerido para una operación."""
+        simbolo_upper = simbolo.upper()
+        
+        # Apalancamiento típico
+        apalancamiento = 30  # 30:1 para Forex
+        
+        if 'XAU' in simbolo_upper:
+            apalancamiento = 20
+        elif any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
+            apalancamiento = 20
+        elif any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
+            apalancamiento = 10
+        
+        # Tamaño del contrato
+        contract_size = 100000  # 1 lote = 100,000 unidades
+        
+        if 'XAU' in simbolo_upper:
+            contract_size = 100  # 1 lote = 100 onzas
+        elif any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
+            contract_size = 1  # 1 lote = 1 contrato
+        elif any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
+            contract_size = 1  # 1 lote = 1 unidad
+        
+        # Margen estimado
+        valor_operacion = lotes * contract_size * precio
+        margen = valor_operacion / apalancamiento
+        
+        return margen
+    
+    def calcular_lotes_segun_capital(self,
+                                     simbolo: str,
+                                     capital: float) -> Dict[str, Any]:
+        """Calcula lotes según capital disponible."""
+        simbolo_upper = simbolo.upper()
+        
+        # Obtener límites
+        lote_max = self.lotes_max.get(simbolo_upper, self.lotes_max_default)
+        lote_min = self.lotes_min.get(simbolo_upper, self.lotes_min_default)
+        
+        # ✅ CORRECCIÓN: Límites según capital
+        if capital < 1000:
+            factor_capital = 0.3
+        elif capital < 5000:
+            factor_capital = 0.6
+        elif capital < 10000:
+            factor_capital = 0.8
+        else:
+            factor_capital = 1.0
+        
+        lote_max_ajustado = lote_max * factor_capital
+        
+        # Límites especiales para activos de alto margen
+        if 'XAU' in simbolo_upper:
+            lote_max_ajustado = min(lote_max_ajustado, 0.05)
+        elif any(x in simbolo_upper for x in ['BTC', 'ETH', 'SOL']):
+            lote_max_ajustado = min(lote_max_ajustado, 0.02)
+        elif any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
+            lote_max_ajustado = min(lote_max_ajustado, 0.05)
+        
+        return {
+            'lote_minimo': lote_min,
+            'lote_maximo': lote_max_ajustado,
+            'lote_recomendado': round((lote_min + lote_max_ajustado) / 2, 2),
+            'factor_capital': factor_capital,
+            'capital': capital,
+        }
+
+
+# ============================================================
+# FUNCIÓN DE UTILIDAD
+# ============================================================
+
+def create_calculador_lotes(config: Optional[Any] = None,
+                            modo_backtest: bool = False) -> CalculadorLotes:
+    """Crea una instancia de CalculadorLotes."""
+    return CalculadorLotes(
+        config=config,
+        modo_backtest=modo_backtest
+    )

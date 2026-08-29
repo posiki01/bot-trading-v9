@@ -13,7 +13,7 @@ logger = logging.getLogger('BotTrading.ML.Mining')
 class HardNegativeMiner:
     """
     Hard Negative Mining - Analiza rechazos y ajusta bias.
-    V9.0 - INDEPENDIENTE.
+    V9.0 - COMPLETO.
     """
     
     def __init__(self,

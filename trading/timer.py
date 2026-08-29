@@ -177,31 +177,18 @@ class EntryTimer:
     # ============================================================
     
     def validar_momento_exacto(self,
-                               simbolo: str,
-                               modo: str,
-                               df_m5: pd.DataFrame,
-                               precio_actual: float,
-                               nivel_usado: Optional[float] = None,
-                               direccion: str = 'COMPRA',
-                               regimen: str = 'INCERTO',
-                               volumen_relativo: float = 1.0,
-                               fecha_vela: Optional[datetime] = None) -> Tuple[bool, str, Dict]:
+                           simbolo: str,
+                           modo: str,
+                           df_m5: pd.DataFrame,
+                           precio_actual: float,
+                           nivel_usado: Optional[float] = None,
+                           direccion: str = 'COMPRA',
+                           regimen: str = 'INCERTO',
+                           volumen_relativo: float = 1.0,
+                           fecha_vela: Optional[datetime] = None) -> Tuple[bool, str, Dict]:
         """
         Valida si el momento actual es exacto para la entrada.
-        
-        Args:
-            simbolo: Símbolo
-            modo: Modo de entrada
-            df_m5: DataFrame M5
-            precio_actual: Precio actual
-            nivel_usado: Nivel usado (opcional)
-            direccion: Dirección
-            regimen: Régimen de mercado
-            volumen_relativo: Volumen relativo
-            fecha_vela: Fecha de la vela (para backtest)
-        
-        Returns:
-            (valido, razon, detalles)
+        V9.40 - CORREGIDO DEFINITIVO: Verifica dirección del M5.
         """
         if fecha_vela is None:
             fecha_vela = datetime.now(timezone.utc)
@@ -223,6 +210,36 @@ class EntryTimer:
         if df_m5 is None or len(df_m5) < 3:
             return False, "Datos insuficientes", detalles
         
+        # ============================================================
+        # ✅ NUEVO V9.40: VALIDAR DIRECCIÓN DEL M5
+        # ============================================================
+        direccion_m5 = self._determinar_direccion_m5(df_m5)
+        detalles['direccion_m5'] = direccion_m5
+        
+        # ✅ NO PERMITIR VENTA si M5 es alcista
+        if direccion == 'VENTA' and direccion_m5 == 'ALCISTA':
+            return False, f"M5 en tendencia ALCISTA - no permitir VENTA", detalles
+        
+        # ✅ NO PERMITIR COMPRA si M5 es bajista
+        if direccion == 'COMPRA' and direccion_m5 == 'BAJISTA':
+            return False, f"M5 en tendencia BAJISTA - no permitir COMPRA", detalles
+        
+        # ✅ SOLO PERMITIR si M5 está ALINEADO con la dirección
+        if direccion == 'COMPRA' and direccion_m5 != 'ALCISTA':
+            if direccion_m5 == 'LATERAL':
+                # Permitir solo si hay nivel clave
+                if nivel_usado is None:
+                    return False, "M5 lateral sin nivel clave", detalles
+            else:
+                return False, f"M5 en {direccion_m5} - no permitir COMPRA", detalles
+        
+        if direccion == 'VENTA' and direccion_m5 != 'BAJISTA':
+            if direccion_m5 == 'LATERAL':
+                if nivel_usado is None:
+                    return False, "M5 lateral sin nivel clave", detalles
+            else:
+                return False, f"M5 en {direccion_m5} - no permitir VENTA", detalles
+        
         # 2. Validar toque de nivel (para modos que lo requieren)
         if modo in ['RETEST', 'RETEST_FALLBACK', 'NIVEL_FUERTE', 'VELA_BORDE']:
             if nivel_usado is None:
@@ -231,6 +248,14 @@ class EntryTimer:
             valido, razon = self._validar_toque_nivel(
                 df_m5, nivel_usado, precio_actual, direccion, cfg, simbolo
             )
+            
+            # ✅ NUEVO: Si el precio está MUY cerca del nivel, permitir
+            distancia = abs(precio_actual - nivel_usado) / precio_actual * 100
+            if not valido and distancia < 0.2:
+                self.logger.debug(f"⚠️ {simbolo}: Precio muy cerca del nivel ({distancia:.2f}%), permitiendo")
+                valido = True
+                razon = "Precio muy cerca del nivel"
+            
             if not valido:
                 return False, razon, detalles
             detalles['toque_nivel'] = True
@@ -240,6 +265,16 @@ class EntryTimer:
             valido, razon = self._validar_fin_pullback(
                 df_m5, precio_actual, direccion, cfg, simbolo
             )
+            
+            # ✅ NUEVO: Si el precio está en la zona del 50%, permitir
+            if not valido and nivel_usado:
+                # Calcular distancia al 50% del rango
+                if direccion == 'COMPRA':
+                    distancia_50 = abs(precio_actual - (nivel_usado * 0.5)) / precio_actual * 100
+                    if distancia_50 < 0.5:
+                        valido = True
+                        razon = "Precio en zona del 50%"
+            
             if not valido:
                 return False, razon, detalles
             detalles['fin_pullback'] = True
@@ -252,6 +287,14 @@ class EntryTimer:
             valido, razon = self._validar_breakout(
                 df_m5, nivel_usado, precio_actual, direccion, volumen_relativo, cfg, simbolo
             )
+            
+            # ✅ NUEVO: Si el precio está JUSTO en el nivel, permitir
+            if not valido:
+                distancia = abs(precio_actual - nivel_usado) / precio_actual * 100
+                if distancia < 0.1 and volumen_relativo > 0.5:
+                    valido = True
+                    razon = "Precio en nivel de breakout"
+            
             if not valido:
                 return False, razon, detalles
             detalles['breakout_confirmado'] = True
@@ -270,6 +313,14 @@ class EntryTimer:
             valido, razon = self._validar_vela_confirmacion(
                 df_m5, direccion, cfg, simbolo
             )
+            
+            # ✅ NUEVO: Si el precio está en nivel, no requerir vela de confirmación
+            if not valido and modo in ['RETEST', 'NIVEL_FUERTE']:
+                distancia = abs(precio_actual - nivel_usado) / precio_actual * 100 if nivel_usado else 999
+                if distancia < 0.1:
+                    valido = True
+                    razon = "Precio en nivel, no requiere confirmación"
+            
             if not valido:
                 return False, razon, detalles
             detalles['vela_confirmacion'] = True
@@ -286,7 +337,47 @@ class EntryTimer:
             self.logger.debug(f"✅ {simbolo}: Momento exacto validado para {modo}")
         
         return True, "Momento exacto validado", detalles
-    
+
+    def _determinar_direccion_m5(self, df_m5: pd.DataFrame) -> str:
+        """
+        Determina la dirección del M5 basado en EMAs y precio.
+        V9.40 - NUEVO: Para validar que la dirección del M5 sea correcta.
+        """
+        if df_m5 is None or len(df_m5) < 20:
+            return 'LATERAL'
+        
+        try:
+            # EMAs
+            ema9 = df_m5['Close'].ewm(span=9, adjust=False).mean()
+            ema21 = df_m5['Close'].ewm(span=21, adjust=False).mean()
+            ema50 = df_m5['Close'].ewm(span=50, adjust=False).mean()
+            
+            # Precio actual
+            precio_actual = df_m5['Close'].iloc[-1]
+            
+            # Condiciones alcistas
+            if ema9.iloc[-1] > ema21.iloc[-1] and ema21.iloc[-1] > ema50.iloc[-1]:
+                if precio_actual > ema9.iloc[-1]:
+                    return 'ALCISTA'
+            
+            # Condiciones bajistas
+            if ema9.iloc[-1] < ema21.iloc[-1] and ema21.iloc[-1] < ema50.iloc[-1]:
+                if precio_actual < ema9.iloc[-1]:
+                    return 'BAJISTA'
+            
+            # Momentum (RSI)
+            if len(df_m5) >= 14:
+                rsi = self._calcular_rsi(df_m5['Close'])
+                if rsi > 60:
+                    return 'ALCISTA'
+                elif rsi < 40:
+                    return 'BAJISTA'
+            
+            return 'LATERAL'
+            
+        except Exception:
+            return 'LATERAL'
+        
     # ============================================================
     # VALIDACIÓN DE TOQUE DE NIVEL
     # ============================================================
