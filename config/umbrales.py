@@ -159,18 +159,59 @@ class Umbrales:
     }
 
     TRAILING = {
+        # RETEST
         'trailing_breakeven_retest': 20,
-        'trailing_breakeven_breakout': 25,
-        'trailing_breakeven_pullback': 25,
-        'trailing_breakeven_nivel_fuerte': 15,
-        'trailing_breakeven_sniper_elite': 15,
         'trailing_distancia_retest': 15,
-        'trailing_distancia_breakout': 20,
-        'trailing_distancia_pullback': 18,
-        'trailing_distancia_nivel_fuerte': 12,
-        'trailing_distancia_sniper_elite': 12,
         'trailing_agresivo_umbral_retest': 70,
         'trailing_agresivo_distancia_retest': 10,
+        
+        # BREAKOUT
+        'trailing_breakeven_breakout': 25,
+        'trailing_distancia_breakout': 20,
+        'trailing_agresivo_umbral_breakout': 80,
+        'trailing_agresivo_distancia_breakout': 15,
+        
+        # PULLBACK
+        'trailing_breakeven_pullback': 25,
+        'trailing_distancia_pullback': 18,
+        'trailing_agresivo_umbral_pullback': 80,
+        'trailing_agresivo_distancia_pullback': 12,
+        
+        # NIVEL_FUERTE
+        'trailing_breakeven_nivel_fuerte': 15,
+        'trailing_distancia_nivel_fuerte': 12,
+        'trailing_agresivo_umbral_nivel_fuerte': 60,
+        'trailing_agresivo_distancia_nivel_fuerte': 8,
+        
+        # SNIPER_ELITE
+        'trailing_breakeven_sniper_elite': 15,
+        'trailing_distancia_sniper_elite': 12,
+        'trailing_agresivo_umbral_sniper_elite': 60,
+        'trailing_agresivo_distancia_sniper_elite': 8,
+        
+        # PATRON
+        'trailing_breakeven_patron': 20,
+        'trailing_distancia_patron': 15,
+        'trailing_agresivo_umbral_patron': 70,
+        'trailing_agresivo_distancia_patron': 10,
+        
+        # RUPTURA_FALSA
+        'trailing_breakeven_ruptura_falsa': 15,
+        'trailing_distancia_ruptura_falsa': 12,
+        'trailing_agresivo_umbral_ruptura_falsa': 50,
+        'trailing_agresivo_distancia_ruptura_falsa': 8,
+        
+        # VELA_BORDE
+        'trailing_breakeven_vela_borde': 15,
+        'trailing_distancia_vela_borde': 12,
+        'trailing_agresivo_umbral_vela_borde': 50,
+        'trailing_agresivo_distancia_vela_borde': 8,
+        
+        # RETEST_FALLBACK
+        'trailing_breakeven_retest_fallback': 20,
+        'trailing_distancia_retest_fallback': 15,
+        'trailing_agresivo_umbral_retest_fallback': 70,
+        'trailing_agresivo_distancia_retest_fallback': 10,
     }
 
     PIP = {
@@ -251,35 +292,32 @@ class Umbrales:
     # ============================================================
 
     LOTES_MAX_POR_ACTIVO = {
-        # Forex
-        'EURUSD': 0.02,  # ✅ REDUCIDO de 0.50 a 0.02
-        'GBPUSD': 0.02,  # ✅ REDUCIDO de 0.50 a 0.02
-        'USDJPY': 0.02,  # ✅ REDUCIDO de 0.50 a 0.02
-        'AUDUSD': 0.02,  # ✅ REDUCIDO de 0.50 a 0.02
-        'USDCAD': 0.02,  # ✅ REDUCIDO de 0.50 a 0.02
-        'USDCHF': 0.02,  # ✅ REDUCIDO de 0.50 a 0.02
-        'EURGBP': 0.02,  # ✅ REDUCIDO de 0.40 a 0.02
-        'EURJPY': 0.02,  # ✅ REDUCIDO de 0.40 a 0.02
-        'GBPJPY': 0.02,  # ✅ REDUCIDO de 0.40 a 0.02
-        'AUDJPY': 0.02,  # ✅ REDUCIDO de 0.40 a 0.02
-        'GBPAUD': 0.02,  # ✅ REDUCIDO de 0.40 a 0.02
-        'EURNZD': 0.02,  # ✅ REDUCIDO de 0.30 a 0.02
-        'EURCHF': 0.02,  # ✅ REDUCIDO de 0.30 a 0.02
-        'GBPCHF': 0.02,  # ✅ REDUCIDO de 0.30 a 0.02
+        # Forex Mayores
+        'EURUSD': 0.03,   # ✅ Permitir hasta 0.03
+        'GBPUSD': 0.02,   # ✅ Permitir hasta 0.02
+        'USDJPY': 0.03,   # ✅ Permitir hasta 0.03
+        'AUDUSD': 0.02,   # ✅ Permitir hasta 0.02
+        'USDCAD': 0.02,   # ✅ Permitir hasta 0.02
+        'USDCHF': 0.02,   # ✅ Permitir hasta 0.02
+        
+        # Forex Cruzados
+        'EURJPY': 0.01,   # ✅ SOLO 0.01 (alta precaución)
+        'GBPJPY': 0.01,   # ✅ SOLO 0.01 (muy volátil)
+        'AUDJPY': 0.01,   # ✅ SOLO 0.01 (alta precaución)
         
         # Metales
-        'XAUUSD': 0.01,  # ✅ REDUCIDO de 0.05 a 0.01
-        'XAGUSD': 0.01,  # ✅ REDUCIDO de 0.05 a 0.01
+        'XAUUSD': 0.01,   # ✅ SOLO 0.01 (cautela extrema)
+        'XAGUSD': 0.01,   # ✅ SOLO 0.01 (NO recomendado, pero permitir mínimo)
         
         # Índices
-        'US30': 0.01,    # ✅ REDUCIDO de 0.05 a 0.01
-        'NAS100': 0.01,  # ✅ REDUCIDO de 0.05 a 0.01
-        'US500': 0.01,   # ✅ REDUCIDO de 0.10 a 0.01
+        'US30': 0.01,     # ✅ SOLO 0.01 (NO recomendado, pero permitir mínimo)
+        'NAS100': 0.01,   # ✅ SOLO 0.01 (NO recomendado, pero permitir mínimo)
+        'US500': 0.01,    # ✅ SOLO 0.01 (NO recomendado, pero permitir mínimo)
         
         # Cripto
-        'BTCUSD': 0.01,  # ✅ MANTENIDO
-        'ETHUSD': 0.01,  # ✅ REDUCIDO de 0.02 a 0.01
-        'SOLUSD': 0.01,  # ✅ REDUCIDO de 0.02 a 0.01
+        'BTCUSD': 0.01,   # ✅ SOLO 0.01 (moderado)
+        'ETHUSD': 0.01,   # ✅ SOLO 0.01 (operable)
+        'SOLUSD': 0.05,   # ✅ Permitir hasta 0.05 (flexible)
     }
     # ============================================================
     # ✅ NUEVO V9.37: CONFIGURACIONES POR MODO PARA SL/TP
@@ -386,6 +424,52 @@ class Umbrales:
         'tp_min_pips': 50,        # ✅ AUMENTADO de 25 a 50
         'tp_max_pips': 600,       # ✅ AUMENTADO de 200 a 600
     },
+    'SPREAD_MAX_POR_ACTIVO': {
+        # Forex
+        'EURUSD': 2.0, 'GBPUSD': 2.0, 'USDJPY': 2.0,
+        'AUDUSD': 2.0, 'USDCAD': 2.0, 'USDCHF': 2.0,
+        'EURGBP': 2.0, 'EURJPY': 3.0, 'GBPJPY': 3.0,
+        'AUDJPY': 3.0, 'NZDUSD': 2.0, 'EURNZD': 3.0,
+        'GBPAUD': 3.0, 'EURCHF': 2.0, 'GBPCHF': 3.0,
+        
+        # Metales
+        'XAUUSD': 30.0, 'XAGUSD': 30.0,
+        
+        # Índices
+        'US30': 5.0, 'NAS100': 5.0, 'US500': 5.0, 'SP500': 5.0,
+        
+        # Cripto
+        'BTCUSD': 50.0, 'ETHUSD': 50.0, 'SOLUSD': 50.0,
+    },
+    'RIESGO_MAX_POR_OPERACION' :{
+        # Forex Mayores
+        'EURUSD': 0.01,   # 1%
+        'GBPUSD': 0.01,   # 1%
+        'USDJPY': 0.01,   # 1%
+        'AUDUSD': 0.01,   # 1%
+        'USDCAD': 0.01,   # 1%
+        'USDCHF': 0.01,   # 1%
+        
+        # Forex Cruzados
+        'EURJPY': 0.005,  # 0.5% (alta precaución)
+        'GBPJPY': 0.005,  # 0.5% (muy volátil)
+        'AUDJPY': 0.005,  # 0.5%
+        
+        # Metales
+        'XAUUSD': 0.005,  # 0.5% (cautela extrema)
+        'XAGUSD': 0.005,  # 0.5% (NO recomendado)
+        
+        # Índices
+        'US30': 0.005,    # 0.5% (NO recomendado)
+        'NAS100': 0.005,  # 0.5% (NO recomendado)
+        'US500': 0.005,   # 0.5% (NO recomendado)
+        
+        # Cripto
+        'BTCUSD': 0.005,  # 0.5% (moderado)
+        'ETHUSD': 0.01,   # 1% (operable)
+        'SOLUSD': 0.01,   # 1% (operable)
+    }
+
 }
 
     # ============================================================

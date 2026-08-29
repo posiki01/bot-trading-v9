@@ -708,25 +708,28 @@ class EntryTimer:
     def _obtener_pip_val(self, simbolo: str, precio: float) -> float:
         """
         Obtiene el valor de un pip para el símbolo.
-        
-        Args:
-            simbolo: Símbolo
-            precio: Precio de referencia
-        
-        Returns:
-            Valor del pip
+        V9.2 - CORREGIDO: Usa módulo unificado.
         """
-        simbolo_upper = simbolo.upper()
-        
-        if 'JPY' in simbolo_upper:
-            return 0.01
-        if any(x in simbolo_upper for x in ['XAU', 'XAG']):
-            return 0.10
-        if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
-            return 1.0
-        if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
-            return 1.0
-        return 0.0001
+        try:
+            from utils.parametros_simbolo import get_pip_val
+            return get_pip_val(simbolo, self.mt5 if hasattr(self, 'mt5') else None)
+        except ImportError:
+            simbolo_upper = simbolo.upper()
+            if 'JPY' in simbolo_upper:
+                return 0.01
+            if 'XAU' in simbolo_upper:
+                return 0.01
+            if 'XAG' in simbolo_upper:
+                return 0.01
+            if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
+                return 1.0
+            if 'BTC' in simbolo_upper:
+                return 1.0
+            if 'ETH' in simbolo_upper:
+                return 0.01
+            if 'SOL' in simbolo_upper:
+                return 0.01
+            return 0.0001
     
     # ============================================================
     # MÉTODOS DE GESTIÓN DE ESTADO

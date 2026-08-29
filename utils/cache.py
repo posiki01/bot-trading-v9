@@ -202,12 +202,10 @@ class CacheUnificado:
     # MÉTODOS DE DATOS (DataCache)
     # ============================================================
     
-    def get_datos(self, simbolo: str, timeframe: int, n_velas: int, fetch_func) -> Optional[Any]:
+    def get_datos(self, simbolo, timeframe, n_velas, fetch_func):
         """
-        Obtiene datos de mercado con caché.
-        - Primero intenta desde la caché en memoria.
-        - Luego desde SQLite.
-        - Finalmente desde MT5 (usando la última fecha de SQLite).
+        Obtiene datos de mercado con caché y validación de frescura.
+        V9.2 - CORREGIDO: Valida frescura antes de retornar.
         """
         cache_key = (simbolo, timeframe, n_velas)
         
@@ -215,32 +213,49 @@ class CacheUnificado:
         if cache_key in self._cache:
             entry = self._cache[cache_key]
             if not entry.is_expired(time.time()):
-                self.logger.debug(f"📦 Cache hit: {simbolo} TF{timeframe}")
-                return entry.data
+                # ✅ VALIDAR FRESCURA
+                df = entry.data
+                if df is not None and len(df) > 0:
+                    ultima_fecha = df.index[-1]
+                    antiguedad = (datetime.now(timezone.utc) - ultima_fecha).total_seconds() / 60
+                    
+                    # ✅ Si los datos tienen menos de 1 minuto, retornar
+                    if antiguedad < 1.0:
+                        return df
+                    
+                    # ⚠️ Si los datos son antiguos, intentar actualizar
+                    self.logger.info(f"📥 {simbolo} TF{timeframe}: Datos de caché antiguos ({antiguedad:.1f} min), actualizando...")
+                    # NO retornar, continuar al siguiente paso
         
         # 2. Intentar desde SQLite
-        df_sqlite = None
         if self.almacen:
-            try:
-                df_sqlite = self.almacen.obtener_datos_historicos(simbolo, timeframe)
-                if df_sqlite is not None and not df_sqlite.empty:
-                    self.logger.info(f"✅ {simbolo} TF{timeframe}: Datos cargados desde SQLite ({len(df_sqlite)} velas)")
-                    self.set(cache_key, df_sqlite, ttl=self.ttls.get(timeframe, 300))
+            df_sqlite = self.almacen.obtener_datos_historicos(simbolo, timeframe)
+            if df_sqlite is not None and not df_sqlite.empty:
+                # ✅ VALIDAR FRESCURA
+                ultima_fecha = df_sqlite.index[-1]
+                antiguedad = (datetime.now(timezone.utc) - ultima_fecha).total_seconds() / 60
+                if antiguedad < 2.0:
                     return df_sqlite
-            except Exception as e:
-                self.logger.warning(f"⚠️ {simbolo} TF{timeframe}: Error cargando desde SQLite: {e}")
+                
+                self.logger.info(f"📥 {simbolo} TF{timeframe}: Datos SQLite antiguos ({antiguedad:.1f} min), actualizando...")
         
-        # 3. Si no hay datos, obtener de MT5
-        self.logger.info(f"📥 {simbolo} TF{timeframe}: Descargando de MT5...")
-        data = fetch_func(simbolo, n_velas, timeframe)
+        # 3. Si no hay datos frescos, obtener de MT5
+        if fetch_func:
+            data = fetch_func(simbolo, n_velas, timeframe)
+            if data is not None:
+                self.set(cache_key, data)
+                return data
         
-        if data is not None:
-            self.set(cache_key, data, ttl=self.ttls.get(timeframe, 300))
-            self.logger.info(f"✅ {simbolo} TF{timeframe}: Datos guardados en caché ({len(data)} velas)")
-        else:
-            self.logger.warning(f"⚠️ {simbolo} TF{timeframe}: No se pudieron obtener datos de MT5")
+        # 4. Fallback: usar datos antiguos si no se pueden actualizar
+        if cache_key in self._cache:
+            return self._cache[cache_key].data
         
-        return data
+        if self.almacen:
+            df_sqlite = self.almacen.obtener_datos_historicos(simbolo, timeframe)
+            if df_sqlite is not None:
+                return df_sqlite
+        
+        return None
 
     def get(self, key: Union[Tuple, str], ttl: Optional[int] = None) -> Optional[Any]:
         if isinstance(key, str):

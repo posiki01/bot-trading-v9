@@ -371,36 +371,52 @@ class CalculadorSLTP:
     # ============================================================
 
     def _obtener_pip_val(self, simbolo: str, precio: float) -> float:
-        simbolo_upper = simbolo.upper()
-        if 'JPY' in simbolo_upper:
-            return 0.01
-        if 'XAU' in simbolo_upper:
-            return 0.01
-        if 'XAG' in simbolo_upper:
-            return 0.1
-        if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500', 'SP500']):
-            return 1.0
-        if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
-            return 1.0
-        return 0.0001
+        try:
+            from utils.parametros_simbolo import get_pip_val
+            return get_pip_val(simbolo, self.mt5 if hasattr(self, 'mt5') else None)
+        except ImportError:
+            simbolo_upper = simbolo.upper()
+            if 'JPY' in simbolo_upper:
+                return 0.01
+            if 'XAU' in simbolo_upper:
+                return 0.01
+            if 'XAG' in simbolo_upper:
+                return 0.01
+            if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500', 'SP500']):
+                return 1.0
+            if 'BTC' in simbolo_upper:
+                return 1.0
+            if 'ETH' in simbolo_upper:
+                return 0.01
+            if 'SOL' in simbolo_upper:
+                return 0.01
+            return 0.0001
 
     # ============================================================
     # OBTENER DIGITS (EXISTENTE - SIN CAMBIOS)
     # ============================================================
 
     def _obtener_digits(self, simbolo: str) -> int:
-        simbolo_upper = simbolo.upper()
-        if 'JPY' in simbolo_upper:
-            return 3
-        if 'XAU' in simbolo_upper:
-            return 2
-        if 'XAG' in simbolo_upper:
-            return 3
-        if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
-            return 1
-        if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
-            return 2
-        return 5
+        try:
+            from utils.parametros_simbolo import get_digits
+            return get_digits(simbolo, self.mt5 if hasattr(self, 'mt5') else None)
+        except ImportError:
+            simbolo_upper = simbolo.upper()
+            if 'JPY' in simbolo_upper:
+                return 3
+            if 'XAU' in simbolo_upper:
+                return 2
+            if 'XAG' in simbolo_upper:
+                return 3
+            if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
+                return 1
+            if 'BTC' in simbolo_upper:
+                return 2
+            if 'ETH' in simbolo_upper:
+                return 2
+            if 'SOL' in simbolo_upper:
+                return 2
+            return 5
 
 
 # ============================================================

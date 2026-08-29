@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
 """
-mt5/conector_mt5.py (V9.4 - CORREGIDO DEFINITIVO)
+mt5/conector_mt5.py (V9.5 - CORREGIDO DEFINITIVO)
 Conector para MetaTrader 5 con soporte para Pepperstone y modo Headless.
-
-CORRECCIONES V9.4:
-- Conversión de time a datetime con zona horaria UTC (tz-aware)
-- Normalización de índices de DataFrame a UTC antes de combinar
-- Manejo robusto de fechas en copy_rates_range
-- VALIDACIÓN DE MERCADO CERRADO antes de descargar datos
+V9.5: Usa self.mt5 en lugar de mt5 global para permitir inyección de mocks.
 """
 
 import time
@@ -19,7 +14,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timezone, timedelta
 import concurrent.futures
 import functools
-import MetaTrader5 as mt5
+import MetaTrader5 as mt5_global  # ✅ Import directo
 import pandas as pd
 
 from config.settings import Config
@@ -84,7 +79,7 @@ class ConectorBase(ABC):
         pass
 
     @abstractmethod
-    def obtener_posiciones(self, simbolo: Optional[str] = None, force: bool = False):
+    def obtener_posiciones(self, simbolo=None, force=False):
         pass
 
     @abstractmethod
@@ -152,7 +147,7 @@ class ConectorHeadless(ConectorBase):
         self.logger.info(f"Enviando orden vía REST: {simbolo} {tipo}")
         return {"ticket": 999, "precio": 0}
 
-    def obtener_posiciones(self, simbolo: Optional[str] = None, force: bool = False):
+    def obtener_posiciones(self, simbolo=None, force=False):
         return []
 
     def cerrar_posicion(self, ticket):
@@ -185,11 +180,10 @@ class ConectorHeadless(ConectorBase):
 class ConectorPepperstone(ConectorBase):
     """
     Conector para MetaTrader 5 (Windows) con Pepperstone.
-    V9.4 - CORREGIDO DEFINITIVO: Normalización de zonas horarias en DataFrames.
-    V9.10 - AGREGADO: Validación de mercado cerrado antes de descargar.
+    V9.5 - CORREGIDO DEFINITIVO: Usa self.mt5 en lugar de mt5 global.
     """
     
-    def __init__(self, login, password, server, magic_number=None, demo=True, almacen=None):
+    def __init__(self, login, password, server, magic_number=None, demo=True, almacen=None, mt5_modulo=None):
         self.login = login
         self.password = password
         self.server = server
@@ -197,6 +191,13 @@ class ConectorPepperstone(ConectorBase):
         self.demo = demo
         self.almacen = almacen
         self.conectado = False
+        
+        # ✅ CORRECCIÓN: Usar self.mt5 (inyectable) o importar
+        if mt5_modulo is not None:
+            self.mt5 = mt5_modulo
+        else:
+            import MetaTrader5 as mt5
+            self.mt5 = mt5
         
         # Cachés
         self._cache_simbolos = {}
@@ -238,13 +239,13 @@ class ConectorPepperstone(ConectorBase):
             'BTCUSD': 80, 'ETHUSD': 60, 'SOLUSD': 40,
         }
         
-        self.logger.info(f"🔌 ConectorPepperstone V9.4 CORREGIDO DEFINITIVO inicializado")
+        self.logger.info(f"🔌 ConectorPepperstone V9.5 CORREGIDO DEFINITIVO inicializado")
         self.logger.info(f"   Magic: {self.magic}")
         self.logger.info(f"   Demo: {self.demo}")
         self.logger.info(f"   Rate Limit: {Config.MT5_RATE_LIMIT_PER_SEC}/s")
 
     # ============================================================
-    # MÉTODOS DE CONEXIÓN
+    # MÉTODOS DE CONEXIÓN (✅ USANDO self.mt5)
     # ============================================================
     
     def _obtener_deviation(self, simbolo: str) -> int:
@@ -270,7 +271,7 @@ class ConectorPepperstone(ConectorBase):
                 return True
             
             try:
-                info = mt5.symbol_info(simbolo)
+                info = self.mt5.symbol_info(simbolo)  # ✅ self.mt5
             except Exception as e:
                 self.logger.warning(f"⚠️ Error obteniendo info de {simbolo}: {e}")
                 return False
@@ -281,7 +282,7 @@ class ConectorPepperstone(ConectorBase):
             
             for intento in range(3):
                 try:
-                    if mt5.symbol_select(simbolo, True):
+                    if self.mt5.symbol_select(simbolo, True):  # ✅ self.mt5
                         self._symbol_selected.add(simbolo)
                         self._cache_simbolos[simbolo] = info
                         return True
@@ -300,7 +301,7 @@ class ConectorPepperstone(ConectorBase):
     def _get_symbol_info(self, simbolo):
         if simbolo in self._cache_simbolos:
             return self._cache_simbolos[simbolo]
-        info = mt5.symbol_info(simbolo)
+        info = self.mt5.symbol_info(simbolo)  # ✅ self.mt5
         if info:
             self._cache_simbolos[simbolo] = info
         return info
@@ -308,14 +309,14 @@ class ConectorPepperstone(ConectorBase):
     @retry_mt5(max_retries=5, base_delay=1.0, max_delay=16.0)
     def conectar(self) -> bool:
         self.logger.info(f"Conectando a {self.server}...")
-        if not mt5.initialize(login=self.login, password=self.password, 
+        if not self.mt5.initialize(login=self.login, password=self.password,  # ✅ self.mt5
                              server=self.server, timeout=10000):
-            error = mt5.last_error()
+            error = self.mt5.last_error()  # ✅ self.mt5
             self.logger.error(f"❌ Error MT5: {error}")
             return False
         
         self.conectado = True
-        account = mt5.account_info()
+        account = self.mt5.account_info()  # ✅ self.mt5
         if account:
             self.logger.info(f"✅ Conectado - Balance: ${account.balance:.2f}, "
                            f"Equity: ${account.equity:.2f}")
@@ -323,7 +324,7 @@ class ConectorPepperstone(ConectorBase):
         return False
 
     def verificar_conexion(self) -> bool:
-        term = mt5.terminal_info()
+        term = self.mt5.terminal_info()  # ✅ self.mt5
         if term is not None and term.connected:
             self.conectado = True
             return True
@@ -332,7 +333,7 @@ class ConectorPepperstone(ConectorBase):
         self.conectado = False
         
         try:
-            mt5.shutdown()
+            self.mt5.shutdown()  # ✅ self.mt5
         except Exception:
             pass
         
@@ -342,110 +343,62 @@ class ConectorPepperstone(ConectorBase):
         return self.conectar()
 
     # ============================================================
-    # OBTENCIÓN DE DATOS (CORREGIDO V9.4 + V9.10)
+    # OBTENCIÓN DE DATOS (✅ USANDO self.mt5)
     # ============================================================
 
-    def _validar_frescura(self, df: pd.DataFrame, timeframe: int) -> bool:
-        """
-        Valida si los datos están frescos (última vela cercana).
-        
-        Args:
-            df: DataFrame con datos OHLCV
-            timeframe: Timeframe en minutos (60=H1, 5=M5, etc.)
-        
-        Returns:
-            True si los datos están frescos, False si están desactualizados
-        """
+    def validar_frescura(self, df, timeframe):
+        """Valida si los datos están frescos."""
         if df is None or len(df) == 0:
             return False
         
-        try:
-            # Obtener fecha de la última vela
-            ultima_fecha = df.index[-1]
-            
-            # Convertir a UTC si no lo está
-            if ultima_fecha.tzinfo is None:
-                ultima_fecha = ultima_fecha.replace(tzinfo=timezone.utc)
-            
-            # Calcular tiempo máximo permitido (2x el timeframe)
-            tiempo_maximo = timedelta(minutes=timeframe * 2)
-            
-            # Obtener hora actual
-            ahora = datetime.now(timezone.utc)
-            
-            # Calcular diferencia
-            diferencia = ahora - ultima_fecha
-            
-            # Si la diferencia es mayor al máximo permitido, los datos están desactualizados
-            if diferencia > tiempo_maximo:
-                self.logger.warning(f"⚠️ Datos desactualizados (última: {ultima_fecha}, diff: {diferencia}, max: {tiempo_maximo})")
-                return False
-            
-            return True
-            
-        except Exception as e:
-            self.logger.warning(f"⚠️ Error validando frescura: {e}")
-            return False
+        ultima_fecha = df.index[-1]
+        if ultima_fecha.tzinfo is None:
+            ultima_fecha = ultima_fecha.replace(tzinfo=timezone.utc)
+        
+        antiguedad = (datetime.now(timezone.utc) - ultima_fecha).total_seconds() / 60
+        
+        max_antiguedad = timeframe * 2
+        
+        return antiguedad < max_antiguedad
 
     @retry_mt5(max_retries=Config.MT5_MAX_RETRIES, base_delay=Config.MT5_RETRY_BACKOFF_BASE)
     def obtener_datos(self, simbolo, n_velas=100, timeframe=None):
-        """
-        Obtiene datos de mercado con actualización incremental.
-        V9.7 - CORREGIDO DEFINITIVO: NO limita el histórico al combinar.
-        """
         self._throttle()
         
         if not self.conectado:
-            self.logger.warning(f"⚠️ {simbolo}: No conectado a MT5")
             return None
         
         if not self._seleccionar_simbolo(simbolo):
-            self.logger.warning(f"⚠️ {simbolo}: No se pudo seleccionar en Market Watch")
             return None
         
         tf = timeframe or Config.TIMEFRAME
         cache_key = (simbolo, tf)
         
-        # ============================================================
-        # 1. OBTENER ÚLTIMA FECHA DESDE SQLITE
-        # ============================================================
         ultima_fecha = None
         df_sqlite = None
         
         if self.almacen:
-            try:
-                df_sqlite = self.almacen.obtener_datos_historicos(simbolo, tf)
-                if df_sqlite is not None and not df_sqlite.empty:
-                    ultima_fecha = df_sqlite.index[-1]
-                    self.logger.info(f"📊 {simbolo} TF{tf}: Última vela en SQLite: {ultima_fecha} ({len(df_sqlite)} velas)")
-            except Exception as e:
-                self.logger.debug(f"⚠️ Error leyendo SQLite: {e}")
+            df_sqlite = self.almacen.obtener_datos_historicos(simbolo, tf)
+            if df_sqlite is not None and not df_sqlite.empty:
+                ultima_fecha = df_sqlite.index[-1]
+                antiguedad = (datetime.now(timezone.utc) - ultima_fecha).total_seconds() / 60
+                self.logger.info(f"📊 {simbolo} TF{tf}: Última vela en SQLite: {ultima_fecha} ({antiguedad:.1f} min) - {len(df_sqlite)} velas")
         
-        # ============================================================
-        # 2. SI HAY ÚLTIMA FECHA → DESCARGAR INCREMENTAL (SIEMPRE)
-        # ============================================================
         if ultima_fecha is not None:
-            self.logger.info(f"📥 {simbolo} TF{tf}: Actualizando desde {ultima_fecha}...")
-            
-            # ✅ CORRECCIÓN: Intentar descargar INCLUSO con mercado cerrado
             df_nuevo = self._descargar_incremental(simbolo, tf, ultima_fecha, n_velas)
             
             if df_nuevo is not None and len(df_nuevo) > 0:
-                # ✅ COMBINAR CON DATOS EXISTENTES
                 if df_sqlite is not None and len(df_sqlite) > 0:
-                    # Asegurar que ambos tengan índice tz-aware
                     if df_sqlite.index.tz is None:
                         df_sqlite.index = df_sqlite.index.tz_localize('UTC')
                     if df_nuevo.index.tz is None:
                         df_nuevo.index = df_nuevo.index.tz_localize('UTC')
                     
-                    # ✅ CORRECCIÓN: NO LIMITAR A n_velas
                     df_combinado = pd.concat([df_sqlite, df_nuevo])
                     df_combinado = df_combinado[~df_combinado.index.duplicated(keep='last')]
                     df_combinado = df_combinado.sort_index()
                     
-                    # ✅ LIMITAR SOLO SI ES DEMASIADO GRANDE (ej: > 50000)
-                    MAX_VELAS = 50000  # Límite de seguridad
+                    MAX_VELAS = 50000
                     if len(df_combinado) > MAX_VELAS:
                         df_combinado = df_combinado.iloc[-MAX_VELAS:]
                     
@@ -455,27 +408,66 @@ class ConectorPepperstone(ConectorBase):
                     self._cache_simbolos_data[cache_key] = df_nuevo
                     return df_nuevo
             else:
-                # No hay datos nuevos, devolver existentes
                 if df_sqlite is not None and len(df_sqlite) > 0:
                     self.logger.warning(f"⚠️ {simbolo} TF{tf}: No hay datos nuevos desde {ultima_fecha}")
                     self._cache_simbolos_data[cache_key] = df_sqlite
                     return df_sqlite
                 return None
         
-        # ============================================================
-        # 3. PRIMERA DESCARGA (NO HAY DATOS EN SQLITE)
-        # ============================================================
         self.logger.info(f"📥 {simbolo} TF{tf}: Primera descarga...")
         return self._descargar_completo(simbolo, tf, n_velas)
 
-    def _descargar_completo(self, simbolo: str, tf: int, n_velas: int) -> Optional[pd.DataFrame]:
-        """
-        Descarga datos completos (primera vez).
-        V9.8 - CORREGIDO: Descarga 90 días desde M5 si el broker no tiene.
-        """
-        # 1. Intentar desde broker con copy_rates_from_pos
+    def obtener_margen(self, simbolo: str, volumen: float, precio: float) -> float:
+        if not self.conectado:
+            return 0.0
+        
         try:
-            rates = mt5.copy_rates_from_pos(simbolo, tf, 0, n_velas)
+            margen = self.mt5.order_calc_margin(  # ✅ self.mt5
+                action=self.mt5.TRADE_ACTION_DEAL,
+                symbol=simbolo,
+                volume=volumen,
+                price=precio
+            )
+            
+            if margen and margen > 0:
+                self.logger.info(f"📊 {simbolo}: Margen REAL: ${margen:.2f}")
+                return float(margen)
+            
+            info = self.mt5.symbol_info(simbolo)  # ✅ self.mt5
+            if info and hasattr(info, 'margin_initial'):
+                margin_initial = float(info.margin_initial or 0)
+                if margin_initial > 0:
+                    margen_ajustado = margin_initial * volumen * (precio / info.trade_tick_size)
+                    return float(margen_ajustado)
+            
+            self.logger.warning(f"⚠️ {simbolo}: No se pudo obtener margen de MT5")
+            return 0.0
+            
+        except Exception as e:
+            self.logger.warning(f"⚠️ Error obteniendo margen de {simbolo}: {e}")
+            return 0.0
+
+    def calcular_margen(self, simbolo: str, lotes: float, precio: float) -> float:
+        if not self.conectado:
+            return 0.0
+        
+        try:
+            margen = self.mt5.order_calc_margin(  # ✅ self.mt5
+                action=self.mt5.TRADE_ACTION_DEAL,
+                symbol=simbolo,
+                volume=lotes,
+                price=precio
+            )
+            
+            return float(margen) if margen else 0.0
+            
+        except Exception as e:
+            self.logger.warning(f"⚠️ Error calculando margen: {e}")
+            return 0.0
+
+    def _descargar_completo(self, simbolo: str, tf: int, n_velas: int) -> Optional[pd.DataFrame]:
+        try:
+            rates = self.mt5.copy_rates_from_pos(simbolo, tf, 0, n_velas)  # ✅ self.mt5
             
             if rates is not None and len(rates) > 0:
                 df = pd.DataFrame(rates)
@@ -490,11 +482,10 @@ class ConectorPepperstone(ConectorBase):
         except Exception as e:
             self.logger.debug(f"⚠️ {simbolo} TF{tf}: Error en copy_rates_from_pos: {e}")
         
-        # 2. Intentar desde broker con copy_rates_range (90 días)
         try:
             fecha_desde = datetime.now(timezone.utc) - timedelta(days=90)
             fecha_hasta = datetime.now(timezone.utc)
-            rates = mt5.copy_rates_range(simbolo, tf, fecha_desde, fecha_hasta)
+            rates = self.mt5.copy_rates_range(simbolo, tf, fecha_desde, fecha_hasta)  # ✅ self.mt5
             
             if rates is not None and len(rates) > 0:
                 df = pd.DataFrame(rates)
@@ -509,9 +500,8 @@ class ConectorPepperstone(ConectorBase):
         except Exception as e:
             self.logger.debug(f"⚠️ {simbolo} TF{tf}: Error en copy_rates_range: {e}")
         
-        # 3. Construir desde M5 (30000 velas = 104 días)
         try:
-            rates_m5 = mt5.copy_rates_from_pos(simbolo, 5, 0, 30000)
+            rates_m5 = self.mt5.copy_rates_from_pos(simbolo, 5, 0, 30000)  # ✅ self.mt5
             
             if rates_m5 is not None and len(rates_m5) > 0:
                 df_m5 = pd.DataFrame(rates_m5)
@@ -532,27 +522,20 @@ class ConectorPepperstone(ConectorBase):
             self.logger.debug(f"⚠️ {simbolo} TF{tf}: Error construyendo desde M5: {e}")
         
         return None
-    
-    def _descargar_incremental(self, simbolo: str, tf: int, ultima_fecha: datetime, n_velas: int) -> Optional[pd.DataFrame]:
-        """
-        Descarga datos incrementales desde la última fecha guardada.
-        V9.7 - NUEVO: Funciona incluso con mercado cerrado.
-        """
-        # Normalizar fecha a UTC
+
+    def _descargar_incremental(self, simbolo, tf, ultima_fecha, n_velas):
         if ultima_fecha.tzinfo is None:
             ultima_fecha = ultima_fecha.replace(tzinfo=timezone.utc)
         else:
             ultima_fecha = ultima_fecha.astimezone(timezone.utc)
         
-        # Añadir 1 minuto para evitar la última vela duplicada
         fecha_desde = ultima_fecha + timedelta(minutes=1)
         fecha_hasta = datetime.now(timezone.utc)
         
         self.logger.info(f"📥 {simbolo} TF{tf}: Descargando desde {fecha_desde} hasta {fecha_hasta}")
         
-        # Intentar con copy_rates_range (el broker siempre tiene datos)
         try:
-            rates = mt5.copy_rates_range(simbolo, tf, fecha_desde, fecha_hasta)
+            rates = self.mt5.copy_rates_range(simbolo, tf, fecha_desde, fecha_hasta)  # ✅ self.mt5
             
             if rates is not None and len(rates) > 0:
                 df = pd.DataFrame(rates)
@@ -562,7 +545,6 @@ class ConectorPepperstone(ConectorBase):
                 
                 self.logger.info(f"✅ {simbolo} TF{tf}: {len(df)} velas nuevas descargadas")
                 
-                # Guardar en SQLite
                 if self.almacen:
                     self.almacen.guardar_datos_historicos(simbolo, tf, df)
                 
@@ -570,13 +552,11 @@ class ConectorPepperstone(ConectorBase):
             else:
                 self.logger.info(f"ℹ️ {simbolo} TF{tf}: No hay datos nuevos desde {fecha_desde}")
                 return None
-                
         except Exception as e:
             self.logger.warning(f"⚠️ {simbolo} TF{tf}: Error en copy_rates_range: {e}")
             
-            # Fallback: intentar con copy_rates_from_pos
             try:
-                rates = mt5.copy_rates_from_pos(simbolo, tf, 0, n_velas)
+                rates = self.mt5.copy_rates_from_pos(simbolo, tf, 0, n_velas)  # ✅ self.mt5
                 
                 if rates is not None and len(rates) > 0:
                     df = pd.DataFrame(rates)
@@ -595,18 +575,13 @@ class ConectorPepperstone(ConectorBase):
         
         return None
 
-
     def _descargar_con_reintentos(self, simbolo: str, timeframe: int, n_velas: int = 100) -> Optional[pd.DataFrame]:
-        """
-        Descarga datos con múltiples métodos y reintentos.
-        """
         import time
-        import MetaTrader5 as mt5
-        
-        # Métodos de descarga en orden de preferencia
+        import MetaTrader5 as mt5  # ❌ ESTE DEBE SER self.mt5
+        # ✅ CORRECCIÓN: Usar self.mt5
         metodos = [
-            ('copy_rates_from_pos', lambda: mt5.copy_rates_from_pos(simbolo, timeframe, 0, n_velas)),
-            ('copy_rates_range', lambda: mt5.copy_rates_range(
+            ('copy_rates_from_pos', lambda: self.mt5.copy_rates_from_pos(simbolo, timeframe, 0, n_velas)),
+            ('copy_rates_range', lambda: self.mt5.copy_rates_range(
                 simbolo, timeframe, 
                 datetime.now(timezone.utc) - timedelta(days=90), 
                 datetime.now(timezone.utc)
@@ -621,14 +596,10 @@ class ConectorPepperstone(ConectorBase):
                     if rates is not None and len(rates) > 0:
                         self.logger.debug(f"✅ {simbolo} TF{timeframe}: Datos obtenidos con {nombre_metodo} (intento {intento+1})")
                         
-                        # Convertir a DataFrame
                         df = pd.DataFrame(rates)
                         df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
                         df.set_index('time', inplace=True)
-                        df.rename(columns={
-                            'open': 'Open', 'high': 'High', 'low': 'Low',
-                            'close': 'Close', 'tick_volume': 'Volume'
-                        }, inplace=True)
+                        df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'tick_volume': 'Volume'}, inplace=True)
                         
                         return df
                         
@@ -639,8 +610,7 @@ class ConectorPepperstone(ConectorBase):
         return None
 
     @retry_mt5(max_retries=Config.MT5_MAX_RETRIES, base_delay=Config.MT5_RETRY_BACKOFF_BASE)
-    def obtener_datos_desde_fecha(self, simbolo: str, fecha_desde: datetime, 
-                                n_velas: int = 250, timeframe: int = None) -> Optional[pd.DataFrame]:
+    def obtener_datos_desde_fecha(self, simbolo: str, fecha_desde: datetime, n_velas: int = 250, timeframe: int = None) -> Optional[pd.DataFrame]:
         self._throttle()
         
         if not self.conectado:
@@ -653,7 +623,6 @@ class ConectorPepperstone(ConectorBase):
 
         tf = timeframe or Config.TIMEFRAME
         
-        # ✅ CORRECCIÓN V9.4: Normalizar fecha_desde a timezone.utc
         if fecha_desde.tzinfo is None:
             fecha_desde = fecha_desde.replace(tzinfo=timezone.utc)
         else:
@@ -664,7 +633,7 @@ class ConectorPepperstone(ConectorBase):
         self.logger.info(f"📥 {simbolo}: Descargando desde {fecha_desde.strftime('%Y-%m-%d %H:%M')} hasta ahora (TF{tf})")
         
         try:
-            rates = mt5.copy_rates_range(simbolo, tf, fecha_desde, fecha_hasta)
+            rates = self.mt5.copy_rates_range(simbolo, tf, fecha_desde, fecha_hasta)  # ✅ self.mt5
             
             if rates is None or len(rates) == 0:
                 self.logger.warning(f"⚠️ {simbolo}: No hay nuevos datos desde {fecha_desde.strftime('%Y-%m-%d %H:%M')}")
@@ -675,10 +644,7 @@ class ConectorPepperstone(ConectorBase):
             df = pd.DataFrame(rates)
             df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
             df.set_index('time', inplace=True)
-            df.rename(columns={
-                'open': 'Open', 'high': 'High', 'low': 'Low',
-                'close': 'Close', 'tick_volume': 'Volume'
-            }, inplace=True)
+            df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'tick_volume': 'Volume'}, inplace=True)
             
             if n_velas > 0 and len(df) > n_velas:
                 df = df.iloc[-n_velas:]
@@ -705,8 +671,8 @@ class ConectorPepperstone(ConectorBase):
         calc_mode = getattr(info, "trade_calc_mode", None)
         
         forex_modes = {
-            getattr(mt5, "SYMBOL_CALC_MODE_FOREX", None),
-            getattr(mt5, "SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE", None),
+            getattr(self.mt5, "SYMBOL_CALC_MODE_FOREX", None),  # ✅ self.mt5
+            getattr(self.mt5, "SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE", None),  # ✅ self.mt5
         }
         forex_modes.discard(None)
         
@@ -724,71 +690,50 @@ class ConectorPepperstone(ConectorBase):
         
         return point
 
-    # ============================================================
-    # ✅ MÉTODO _es_horario_cerrado (CORREGIDO DEFINITIVO)
-    # ============================================================
-
-    def _es_horario_cerrado(self, simbolo: str) -> bool:
-        """
-        Verifica si el mercado está cerrado para un símbolo.
-        V9.10 - CORREGIDO DEFINITIVO: Solo cripto opera el sábado.
-        
-        Args:
-            simbolo: Símbolo a verificar
-    
-        Returns:
-            True si el mercado está cerrado (no descargar datos)
-        """
+    def _es_horario_cerrado(self, simbolo: str, fecha=None):
+        """Verifica si el mercado está cerrado para un símbolo."""
         try:
-            # Verificar si es cripto (siempre abierto)
             simbolo_upper = simbolo.upper()
             if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
                 return False
             
-            # Obtener hora actual en Colombia
-            ahora = datetime.now(timezone.utc)
+            if fecha is None:
+                ahora = datetime.now().astimezone(timezone.utc)
+            else:
+                ahora = fecha.astimezone(timezone.utc)
+            
             hora_col = ahora.astimezone(timezone(timedelta(hours=-5)))
             weekday_col = hora_col.weekday()
             
-            # SÁBADO: Todo cerrado excepto cripto
             if weekday_col == 5:
                 return True
             
-            # DOMINGO: Forex/Índices/Metales cerrados hasta cierta hora
             if weekday_col == 6:
                 hora_col_float = hora_col.hour + hora_col.minute / 60.0
                 
-                # Forex abre 17:00 COT
                 if self._es_forex(simbolo_upper):
                     return hora_col_float < 17.0
                 
-                # Índices y Metales abren 18:00 COT
                 if self._es_indice(simbolo_upper) or self._es_metal(simbolo_upper):
                     return hora_col_float < 18.0
                 
-                return True  # No es forex ni índice ni metal
+                return True
             
-            # VIERNES: Cierres anticipados
             if weekday_col == 4:
                 hora_col_float = hora_col.hour + hora_col.minute / 60.0
                 
-                # Índices y Metales cierran 16:00 COT
                 if self._es_indice(simbolo_upper) or self._es_metal(simbolo_upper):
                     return hora_col_float >= 16.0
                 
-                # Forex cierra 17:00 COT
                 if self._es_forex(simbolo_upper):
                     return hora_col_float >= 17.0
             
-            # LUNES A JUEVES: Mercado abierto (considerado normal)
             return False
-            
         except Exception as e:
             self.logger.debug(f"⚠️ Error verificando horario: {e}")
             return False
 
     def _es_forex(self, simbolo: str) -> bool:
-        """Verifica si es un par de divisas."""
         pares_forex = [
             'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'USDCHF',
             'EURGBP', 'EURJPY', 'GBPJPY', 'AUDJPY', 'EURNZD', 'GBPAUD',
@@ -799,18 +744,12 @@ class ConectorPepperstone(ConectorBase):
         return simbolo in pares_forex
 
     def _es_indice(self, simbolo: str) -> bool:
-        """Verifica si es un índice."""
         indices = ['US30', 'NAS100', 'US500', 'SP500', 'GER40', 'UK100', 'DAX', 'SPX']
         return any(x in simbolo for x in indices)
 
     def _es_metal(self, simbolo: str) -> bool:
-        """Verifica si es un metal precioso."""
         metales = ['XAU', 'XAG', 'XPT', 'XPD']
         return any(x in simbolo for x in metales)
-
-    # ============================================================
-    # OBTENCIÓN DE PRECIO
-    # ============================================================
 
     def obtener_precio(self, simbolo):
         self.logger.info(f"📥 {simbolo}: Iniciando obtener_precio()")
@@ -819,8 +758,8 @@ class ConectorPepperstone(ConectorBase):
             self.logger.error(f"❌ {simbolo}: MT5 no conectado")
             return None
 
-        max_wait = 1.0
-        poll_interval = 0.10
+        max_wait = 3.0
+        poll_interval = 0.15
         deadline = time.monotonic() + max_wait
         intento = 0
 
@@ -833,7 +772,7 @@ class ConectorPepperstone(ConectorBase):
                     time.sleep(poll_interval)
                     continue
 
-                info = mt5.symbol_info(simbolo)
+                info = self.mt5.symbol_info(simbolo)  # ✅ self.mt5
                 if info is None:
                     self.logger.debug(f"⚠️ {simbolo}: symbol_info=None (intento {intento})")
                     time.sleep(poll_interval)
@@ -845,7 +784,7 @@ class ConectorPepperstone(ConectorBase):
                     time.sleep(poll_interval)
                     continue
 
-                tick = mt5.symbol_info_tick(simbolo)
+                tick = self.mt5.symbol_info_tick(simbolo)  # ✅ self.mt5
                 if tick is None:
                     self.logger.debug(f"⚠️ {simbolo}: tick=None (intento {intento})")
                     time.sleep(poll_interval)
@@ -867,6 +806,33 @@ class ConectorPepperstone(ConectorBase):
                 spread_price = ask - bid
 
                 if spread_price <= 0:
+                    simbolo_upper = simbolo.upper()
+                    if simbolo_upper in ['USDCAD', 'AUDCAD', 'NZDCAD', 'NZDJPY', 'AUDNZD']:
+                        self.logger.debug(f"⏳ {simbolo}: BID==ASK pero símbolo exótico, usando punto mínimo")
+                        spread_price = point
+                        spread_points = 1.0
+                        spread_pips = spread_price / point if point > 0 else 0
+                        
+                        self.logger.info(f"✅ {simbolo}: Tick obtenido (spread=0, usando fallback)")
+                        self.logger.info(f"   BID={bid:.{info.digits}f} | ASK={ask:.{info.digits}f} | spread={spread_price:.{info.digits}f} | {spread_points:.1f} points | {spread_pips:.2f} pips")
+
+                        return {
+                            "bid": bid,
+                            "ask": ask,
+                            "spread": spread_price,
+                            "spread_price": spread_price,
+                            "spread_points": spread_points,
+                            "spread_pips": spread_pips,
+                            "point": point,
+                            "pip_size": self._pip_size_simbolo(simbolo, info),
+                            "tick_size": float(getattr(info, "trade_tick_size", 0.0) or 0.0),
+                            "digits": int(info.digits),
+                            "timestamp": time.time(),
+                            "tick_time": getattr(tick, "time", None),
+                            "tick_time_msc": getattr(tick, "time_msc", None),
+                            "fuente": "symbol_info_tick (spread=0 fallback)",
+                        }
+                    
                     self.logger.debug(f"⏳ {simbolo}: BID==ASK ({bid:.{info.digits}f}), esperando spread > 0 (intento {intento})")
                     time.sleep(poll_interval)
                     continue
@@ -908,70 +874,57 @@ class ConectorPepperstone(ConectorBase):
         self.logger.warning(f"⚠️ {simbolo}: no se obtuvo tick con spread positivo en {max_wait:.1f}s ({intento} intentos)")
         return None
 
-    # ============================================================
-    # ENVÍO DE ÓRDENES
-    # ============================================================
-
     def _obtener_filling_mode(self, simbolo: str) -> int:
         info = self._get_symbol_info(simbolo)
         if not info:
-            return mt5.ORDER_FILLING_IOC
+            return self.mt5.ORDER_FILLING_IOC  # ✅ self.mt5
         
         filling = info.filling_mode
         try:
-            if filling == mt5.SYMBOL_FILLING_MODE_FOK:
-                return mt5.ORDER_FILLING_FOK
-            elif filling == mt5.SYMBOL_FILLING_MODE_IOC:
-                return mt5.ORDER_FILLING_IOC
-            elif filling == mt5.SYMBOL_FILLING_MODE_RETURN:
-                return mt5.ORDER_FILLING_RETURN
+            if filling == self.mt5.SYMBOL_FILLING_MODE_FOK:  # ✅ self.mt5
+                return self.mt5.ORDER_FILLING_FOK  # ✅ self.mt5
+            elif filling == self.mt5.SYMBOL_FILLING_MODE_IOC:  # ✅ self.mt5
+                return self.mt5.ORDER_FILLING_IOC  # ✅ self.mt5
+            elif filling == self.mt5.SYMBOL_FILLING_MODE_RETURN:  # ✅ self.mt5
+                return self.mt5.ORDER_FILLING_RETURN  # ✅ self.mt5
         except AttributeError:
             pass
-        return mt5.ORDER_FILLING_IOC
+        return self.mt5.ORDER_FILLING_IOC  # ✅ self.mt5
 
     @retry_mt5(max_retries=Config.MT5_MAX_RETRIES, base_delay=Config.MT5_RETRY_BACKOFF_BASE)
     def enviar_orden(self, simbolo: str, tipo: str, volumen: float, sl: float, tp: float, comentario: str = "", **kwargs):
-        """
-        Envía una orden al broker.
-        V9.67 - CORREGIDO: Retorna SL/TP del request (no de result).
-        """
-        # ✅ CORREGIDO: Normalizar dirección
         tipo_normalizado = tipo.upper().strip()
         
         if tipo_normalizado in ['COMPRA', 'BUY', 'LONG']:
-            order_type = mt5.ORDER_TYPE_BUY
+            order_type = self.mt5.ORDER_TYPE_BUY  # ✅ self.mt5
             direccion = 'COMPRA'
         elif tipo_normalizado in ['VENTA', 'SELL', 'SHORT']:
-            order_type = mt5.ORDER_TYPE_SELL
+            order_type = self.mt5.ORDER_TYPE_SELL  # ✅ self.mt5
             direccion = 'VENTA'
         else:
             return {'retcode': -1, 'comentario': f"Dirección inválida: {tipo}"}
         
-        # Obtener información del símbolo
-        info = mt5.symbol_info(simbolo)
+        info = self.mt5.symbol_info(simbolo)  # ✅ self.mt5
         if info is None:
             return {'retcode': -1, 'comentario': f"Símbolo inválido: {simbolo}"}
         
-        # Obtener tick actual
-        tick = mt5.symbol_info_tick(simbolo)
+        tick = self.mt5.symbol_info_tick(simbolo)  # ✅ self.mt5
         if tick is None:
             return {'retcode': -1, 'comentario': f"No se pudo obtener tick para {simbolo}"}
         
-        # ✅ CORREGIDO: Validar SL/TP según dirección REAL
         if direccion == 'COMPRA':
             if sl >= tick.ask:
                 return {'retcode': -1, 'comentario': f"SL inválido para COMPRA: SL={sl} >= ask={tick.ask}"}
             if tp <= tick.ask:
                 return {'retcode': -1, 'comentario': f"TP inválido para COMPRA: TP={tp} <= ask={tick.ask}"}
-        else:  # VENTA
+        else:
             if sl <= tick.bid:
                 return {'retcode': -1, 'comentario': f"SL inválido para VENTA: SL={sl} <= bid={tick.bid}"}
             if tp >= tick.bid:
                 return {'retcode': -1, 'comentario': f"TP inválido para VENTA: TP={tp} >= bid={tick.bid}"}
         
-        # Preparar request
         request = {
-            "action": mt5.TRADE_ACTION_DEAL,
+            "action": self.mt5.TRADE_ACTION_DEAL,  # ✅ self.mt5
             "symbol": simbolo,
             "volume": float(volumen),
             "type": order_type,
@@ -981,36 +934,30 @@ class ConectorPepperstone(ConectorBase):
             "deviation": 20,
             "magic": kwargs.get('magic_number', getattr(self, 'magic_number', 0)),
             "comment": comentario,
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_time": self.mt5.ORDER_TIME_GTC,  # ✅ self.mt5
+            "type_filling": self.mt5.ORDER_FILLING_IOC,  # ✅ self.mt5
         }
         
-        # Enviar orden
-        result = mt5.order_send(request)
+        result = self.mt5.order_send(request)  # ✅ self.mt5
         
         if result is None:
             return {'retcode': -1, 'comentario': "Error desconocido en MT5"}
         
-        if result.retcode != mt5.TRADE_RETCODE_DONE:
+        if result.retcode != self.mt5.TRADE_RETCODE_DONE:  # ✅ self.mt5
             return {
                 'retcode': result.retcode,
                 'comentario': f"Error {result.retcode}: {result.comment}",
                 'ticket': None
             }
         
-        # ✅ CORREGIDO V9.67: Usar SL/TP del request (NO de result.sl)
         return {
             'retcode': result.retcode,
             'ticket': result.order,
             'precio': result.price,
-            'sl': request['sl'],  # ✅ El SL que enviamos
-            'tp': request['tp'],  # ✅ El TP que enviamos
+            'sl': request['sl'],
+            'tp': request['tp'],
             'comentario': result.comment
         }
-        
-    # ============================================================
-    # GESTIÓN DE POSICIONES
-    # ============================================================
 
     @retry_mt5(max_retries=Config.MT5_MAX_RETRIES, base_delay=Config.MT5_RETRY_BACKOFF_BASE)
     def cerrar_posicion(self, ticket):
@@ -1020,35 +967,35 @@ class ConectorPepperstone(ConectorBase):
             self.logger.error("❌ Ticket inválido para cerrar")
             return False
         
-        pos = mt5.positions_get(ticket=ticket)
+        pos = self.mt5.positions_get(ticket=ticket)  # ✅ self.mt5
         if not pos:
             self.logger.warning(f"Posición {ticket} no encontrada")
             return False
         
         pos = pos[0]
         for intento in range(3):
-            tick = mt5.symbol_info_tick(pos.symbol)
+            tick = self.mt5.symbol_info_tick(pos.symbol)  # ✅ self.mt5
             if not tick:
                 continue
             
             request = {
-                "action": mt5.TRADE_ACTION_DEAL,
+                "action": self.mt5.TRADE_ACTION_DEAL,  # ✅ self.mt5
                 "symbol": pos.symbol,
                 "volume": pos.volume,
-                "type": mt5.ORDER_TYPE_SELL if pos.type == 0 else mt5.ORDER_TYPE_BUY,
+                "type": self.mt5.ORDER_TYPE_SELL if pos.type == 0 else self.mt5.ORDER_TYPE_BUY,  # ✅ self.mt5
                 "position": ticket,
                 "price": tick.bid if pos.type == 0 else tick.ask,
                 "deviation": self._obtener_deviation(pos.symbol),
                 "magic": self.magic,
                 "comment": "Cierre Bot",
-                "type_time": mt5.ORDER_TIME_GTC,
+                "type_time": self.mt5.ORDER_TIME_GTC,  # ✅ self.mt5
                 "type_filling": self._obtener_filling_mode(pos.symbol),
             }
-            result = mt5.order_send(request)
-            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            result = self.mt5.order_send(request)  # ✅ self.mt5
+            if result and result.retcode == self.mt5.TRADE_RETCODE_DONE:  # ✅ self.mt5
                 self.logger.info(f"✅ Posición {ticket} cerrada correctamente")
                 return True
-            if result and result.retcode in [mt5.TRADE_RETCODE_REQUOTE, mt5.TRADE_RETCODE_PRICE_OFF]:
+            if result and result.retcode in [self.mt5.TRADE_RETCODE_REQUOTE, self.mt5.TRADE_RETCODE_PRICE_OFF]:  # ✅ self.mt5
                 time.sleep(0.1)
                 continue
             break
@@ -1064,7 +1011,7 @@ class ConectorPepperstone(ConectorBase):
             self.logger.error("❌ Ticket inválido para cerrar parcial")
             return False
         
-        pos = mt5.positions_get(ticket=ticket)
+        pos = self.mt5.positions_get(ticket=ticket)  # ✅ self.mt5
         if not pos:
             return False
         
@@ -1075,28 +1022,28 @@ class ConectorPepperstone(ConectorBase):
             return self.cerrar_posicion(ticket)
         
         for intento in range(3):
-            tick = mt5.symbol_info_tick(pos.symbol)
+            tick = self.mt5.symbol_info_tick(pos.symbol)  # ✅ self.mt5
             if not tick:
                 continue
             
             request = {
-                "action": mt5.TRADE_ACTION_DEAL,
+                "action": self.mt5.TRADE_ACTION_DEAL,  # ✅ self.mt5
                 "symbol": pos.symbol,
                 "volume": volumen_a_cerrar,
-                "type": mt5.ORDER_TYPE_SELL if pos.type == 0 else mt5.ORDER_TYPE_BUY,
+                "type": self.mt5.ORDER_TYPE_SELL if pos.type == 0 else self.mt5.ORDER_TYPE_BUY,  # ✅ self.mt5
                 "position": ticket,
                 "price": tick.bid if pos.type == 0 else tick.ask,
                 "deviation": self._obtener_deviation(pos.symbol),
                 "magic": self.magic,
                 "comment": "Cierre Parcial",
-                "type_time": mt5.ORDER_TIME_GTC,
+                "type_time": self.mt5.ORDER_TIME_GTC,  # ✅ self.mt5
                 "type_filling": self._obtener_filling_mode(pos.symbol),
             }
-            result = mt5.order_send(request)
-            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            result = self.mt5.order_send(request)  # ✅ self.mt5
+            if result and result.retcode == self.mt5.TRADE_RETCODE_DONE:  # ✅ self.mt5
                 self.logger.info(f"✅ Cierre parcial {volumen_a_cerrar} de {ticket} exitoso")
                 return True
-            if result and result.retcode in [mt5.TRADE_RETCODE_REQUOTE, mt5.TRADE_RETCODE_PRICE_OFF]:
+            if result and result.retcode in [self.mt5.TRADE_RETCODE_REQUOTE, self.mt5.TRADE_RETCODE_PRICE_OFF]:  # ✅ self.mt5
                 time.sleep(0.1)
                 continue
             break
@@ -1111,7 +1058,7 @@ class ConectorPepperstone(ConectorBase):
             self.logger.error("❌ Ticket inválido para modificar SL")
             return False
         
-        pos = mt5.positions_get(ticket=ticket)
+        pos = self.mt5.positions_get(ticket=ticket)  # ✅ self.mt5
         if not pos:
             return False
         
@@ -1121,16 +1068,16 @@ class ConectorPepperstone(ConectorBase):
 
         for intento in range(3):
             request = {
-                "action": mt5.TRADE_ACTION_SLTP,
+                "action": self.mt5.TRADE_ACTION_SLTP,  # ✅ self.mt5
                 "position": ticket,
                 "sl": round(nuevo_sl, digits),
                 "tp": pos.tp
             }
-            result = mt5.order_send(request)
-            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            result = self.mt5.order_send(request)  # ✅ self.mt5
+            if result and result.retcode == self.mt5.TRADE_RETCODE_DONE:  # ✅ self.mt5
                 self.logger.info(f"✅ SL modificado para {ticket} a {nuevo_sl:.{digits}f}")
                 return True
-            if result and result.retcode in [mt5.TRADE_RETCODE_REQUOTE, mt5.TRADE_RETCODE_PRICE_OFF]:
+            if result and result.retcode in [self.mt5.TRADE_RETCODE_REQUOTE, self.mt5.TRADE_RETCODE_PRICE_OFF]:  # ✅ self.mt5
                 time.sleep(0.1)
                 continue
             break
@@ -1138,16 +1085,12 @@ class ConectorPepperstone(ConectorBase):
         self.logger.error(f"❌ Fallo al modificar SL para {ticket}")
         return False
 
-    # ============================================================
-    # OBTENCIÓN DE INFORMACIÓN
-    # ============================================================
-
     @retry_mt5(max_retries=20, base_delay=0.1, max_delay=5.0)
     def obtener_detalle_cierre(self, ticket):
         if not self.conectado or not ticket:
             return None
         
-        deals = mt5.history_deals_get(position=ticket)
+        deals = self.mt5.history_deals_get(position=ticket)  # ✅ self.mt5
         if deals is None or len(deals) == 0:
             return None
 
@@ -1156,7 +1099,7 @@ class ConectorPepperstone(ConectorBase):
             ganancia += d.profit
             comision += d.commission
             swap += d.swap
-            if d.entry in [mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT, mt5.DEAL_ENTRY_OUT_BY]:
+            if d.entry in [self.mt5.DEAL_ENTRY_OUT, self.mt5.DEAL_ENTRY_INOUT, self.mt5.DEAL_ENTRY_OUT_BY]:  # ✅ self.mt5
                 precio_salida = d.price
                 time_salida = datetime.fromtimestamp(d.time).isoformat()
         
@@ -1172,7 +1115,7 @@ class ConectorPepperstone(ConectorBase):
         if not self.conectado:
             return None
         
-        account = mt5.account_info()
+        account = self.mt5.account_info()  # ✅ self.mt5
         if account:
             return {
                 'login': account.login,
@@ -1195,12 +1138,12 @@ class ConectorPepperstone(ConectorBase):
             return False
         
         try:
-            return mt5.screen_shot(simbolo, tf, str(ruta_archivo))
+            return self.mt5.screen_shot(simbolo, tf, str(ruta_archivo))  # ✅ self.mt5
         except Exception as e:
             self.logger.error(f"Error al tomar captura de {simbolo}: {e}")
             return False
 
-    def obtener_posiciones(self, simbolo: Optional[str] = None, force: bool = False) -> List[Dict[str, Any]]:
+    def obtener_posiciones(self, simbolo=None, force=False):
         if not self.conectado:
             return []
 
@@ -1212,7 +1155,7 @@ class ConectorPepperstone(ConectorBase):
                 return [p for p in self._cache_posiciones if p['simbolo'] == simbolo]
 
         try:
-            positions = mt5.positions_get()
+            positions = self.mt5.positions_get()  # ✅ self.mt5
         except Exception as e:
             self.logger.error(f"Error al obtener posiciones: {e}")
             return []
@@ -1234,7 +1177,7 @@ class ConectorPepperstone(ConectorBase):
                     'precio_actual': p.price_current,
                     'sl': p.sl,
                     'tp': p.tp,
-                    'ganancia': p.profit,
+                    'ganancia': p.profit,  # ✅ P&L en USD de MT5
                     'swap': p.swap,
                     'magic': p.magic,
                     'time': p.time,
@@ -1252,7 +1195,7 @@ class ConectorPepperstone(ConectorBase):
         return self._get_symbol_info(simbolo)
 
     def desconectar(self):
-        mt5.shutdown()
+        self.mt5.shutdown()  # ✅ self.mt5
         self.conectado = False
         self._symbol_selected.clear()
         self._cache_simbolos.clear()
@@ -1260,9 +1203,9 @@ class ConectorPepperstone(ConectorBase):
         self.logger.info("🔒 Desconectado de MT5")
 
     def obtener_historial_operaciones(self, 
-                                   fecha_desde: Optional[datetime] = None,
-                                   fecha_hasta: Optional[datetime] = None,
-                                   simbolo: Optional[str] = None) -> List[Dict[str, Any]]:
+                                   fecha_desde=None,
+                                   fecha_hasta=None,
+                                   simbolo=None):
         if not self.conectado:
             self.logger.error("❌ No conectado a MT5")
             return []
@@ -1279,7 +1222,7 @@ class ConectorPepperstone(ConectorBase):
         operaciones = []
         
         try:
-            deals = mt5.history_deals_get(desde_ts, hasta_ts, symbol=simbolo)
+            deals = self.mt5.history_deals_get(desde_ts, hasta_ts, symbol=simbolo)  # ✅ self.mt5
             
             if deals is not None and len(deals) > 0:
                 self.logger.info(f"📊 MT5: {len(deals)} deals obtenidos")
@@ -1289,14 +1232,14 @@ class ConectorPepperstone(ConectorBase):
                         ticket = deal.order if hasattr(deal, 'order') else deal.deal
                         deal_id = deal.deal if hasattr(deal, 'deal') else deal.order
                         
-                        if deal.type in [mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_BUY_STOP, mt5.DEAL_TYPE_BUY_LIMIT]:
+                        if deal.type in [self.mt5.DEAL_TYPE_BUY, self.mt5.DEAL_TYPE_BUY_STOP, self.mt5.DEAL_TYPE_BUY_LIMIT]:  # ✅ self.mt5
                             direccion = 'COMPRA'
-                        elif deal.type in [mt5.DEAL_TYPE_SELL, mt5.DEAL_TYPE_SELL_STOP, mt5.DEAL_TYPE_SELL_LIMIT]:
+                        elif deal.type in [self.mt5.DEAL_TYPE_SELL, self.mt5.DEAL_TYPE_SELL_STOP, self.mt5.DEAL_TYPE_SELL_LIMIT]:  # ✅ self.mt5
                             direccion = 'VENTA'
                         else:
                             direccion = 'DESCONOCIDO'
                         
-                        if deal.entry in [mt5.DEAL_ENTRY_IN, mt5.DEAL_ENTRY_INOUT]:
+                        if deal.entry in [self.mt5.DEAL_ENTRY_IN, self.mt5.DEAL_ENTRY_INOUT]:  # ✅ self.mt5
                             estado = 'ABIERTA'
                         else:
                             estado = 'CERRADA'
@@ -1308,14 +1251,14 @@ class ConectorPepperstone(ConectorBase):
                             'direccion': direccion,
                             'entrada': deal.price,
                             'volumen': deal.volume,
-                            'ganancia': deal.profit,
+                            'ganancia': deal.profit,  # ✅ P&L de MT5
                             'comision': deal.commission,
                             'swap': deal.swap,
                             'timestamp': datetime.fromtimestamp(deal.time, tz=timezone.utc).isoformat(),
                             'magic': deal.magic,
                             'estado': estado,
                             'tipo': 'DEAL',
-                            'entry_type': 'IN' if deal.entry in [mt5.DEAL_ENTRY_IN, mt5.DEAL_ENTRY_INOUT] else 'OUT',
+                            'entry_type': 'IN' if deal.entry in [self.mt5.DEAL_ENTRY_IN, self.mt5.DEAL_ENTRY_INOUT] else 'OUT',  # ✅ self.mt5
                         }
                         operaciones.append(op)
                         
@@ -1326,7 +1269,7 @@ class ConectorPepperstone(ConectorBase):
                 self.logger.debug("📭 No se obtuvieron deals de MT5")
             
             try:
-                positions = mt5.positions_get(symbol=simbolo)
+                positions = self.mt5.positions_get(symbol=simbolo)  # ✅ self.mt5
                 if positions is not None and len(positions) > 0:
                     self.logger.info(f"📊 MT5: {len(positions)} posiciones abiertas obtenidas")
                     for pos in positions:
@@ -1352,7 +1295,7 @@ class ConectorPepperstone(ConectorBase):
                 self.logger.debug(f"Error obteniendo posiciones: {e}")
             
             try:
-                orders = mt5.orders_get(symbol=simbolo)
+                orders = self.mt5.orders_get(symbol=simbolo)  # ✅ self.mt5
                 if orders is not None and len(orders) > 0:
                     self.logger.info(f"📊 MT5: {len(orders)} órdenes pendientes obtenidas")
                     for order in orders:
@@ -1360,7 +1303,7 @@ class ConectorPepperstone(ConectorBase):
                             op = {
                                 'ticket': order.ticket,
                                 'simbolo': order.symbol,
-                                'direccion': 'COMPRA' if order.type in [mt5.ORDER_TYPE_BUY, mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_TYPE_BUY_STOP] else 'VENTA',
+                                'direccion': 'COMPRA' if order.type in [self.mt5.ORDER_TYPE_BUY, self.mt5.ORDER_TYPE_BUY_LIMIT, self.mt5.ORDER_TYPE_BUY_STOP] else 'VENTA',  # ✅ self.mt5
                                 'entrada': order.price_open,
                                 'volumen': order.volume_initial,
                                 'sl': order.sl,
@@ -1399,11 +1342,7 @@ class ConectorPepperstone(ConectorBase):
             import traceback
             self.logger.debug(traceback.format_exc())
             return []
-    
-    # ============================================================
-    # UTILIDADES INTERNAS
-    # ============================================================
-    
+
     def _obtener_lote_minimo_por_activo(self, simbolo: str) -> float:
         simbolo_upper = simbolo.upper()
         if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500', 'SP500']):

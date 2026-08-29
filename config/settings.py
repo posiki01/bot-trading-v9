@@ -205,21 +205,31 @@ class Config:
     # ============================================================
     
     HORARIOS_POR_ACTIVO = {
+        # FOREX (02:00-16:00, pero operar mejor en 04:00-11:00)
         'EURUSD': {'inicio': 2, 'fin': 16, 'dias': [0, 1, 2, 3, 4]},
         'GBPUSD': {'inicio': 2, 'fin': 16, 'dias': [0, 1, 2, 3, 4]},
         'USDJPY': {'inicio': 2, 'fin': 16, 'dias': [0, 1, 2, 3, 4]},
         'AUDUSD': {'inicio': 2, 'fin': 16, 'dias': [0, 1, 2, 3, 4]},
         'USDCAD': {'inicio': 7, 'fin': 16, 'dias': [0, 1, 2, 3, 4]},
         'USDCHF': {'inicio': 2, 'fin': 16, 'dias': [0, 1, 2, 3, 4]},
-        'EURJPY': {'inicio': 18, 'fin': 2, 'dias': [0, 1, 2, 3, 4]},
-        'GBPJPY': {'inicio': 18, 'fin': 2, 'dias': [0, 1, 2, 3, 4]},
+        'EURGBP': {'inicio': 2, 'fin': 16, 'dias': [0, 1, 2, 3, 4]},
+        'EURJPY': {'inicio': 2, 'fin': 16, 'dias': [0, 1, 2, 3, 4]},
+        'GBPJPY': {'inicio': 2, 'fin': 16, 'dias': [0, 1, 2, 3, 4]},
+        'AUDJPY': {'inicio': 2, 'fin': 16, 'dias': [0, 1, 2, 3, 4]},
+        
+        # METALES (02:00-16:00)
         'XAUUSD': {'inicio': 2, 'fin': 16, 'dias': [0, 1, 2, 3, 4]},
         'XAGUSD': {'inicio': 2, 'fin': 16, 'dias': [0, 1, 2, 3, 4]},
+        
+        # ÍNDICES (07:00-16:00)
         'US30': {'inicio': 7, 'fin': 16, 'dias': [0, 1, 2, 3, 4]},
         'NAS100': {'inicio': 7, 'fin': 16, 'dias': [0, 1, 2, 3, 4]},
         'US500': {'inicio': 7, 'fin': 16, 'dias': [0, 1, 2, 3, 4]},
+        
+        # CRIPTO 24/7
         'BTCUSD': {'inicio': 0, 'fin': 24, 'dias': [0, 1, 2, 3, 4, 5, 6]},
         'ETHUSD': {'inicio': 0, 'fin': 24, 'dias': [0, 1, 2, 3, 4, 5, 6]},
+        'SOLUSD': {'inicio': 0, 'fin': 24, 'dias': [0, 1, 2, 3, 4, 5, 6]},
     }
     
     # ============================================================
@@ -233,15 +243,18 @@ class Config:
         'AUDUSD': {'spread_max': 2.0, 'sesion': 'LDN_NY', 'pts_min': 50},
         'USDCAD': {'spread_max': 2.0, 'sesion': 'NY', 'pts_min': 50},
         'USDCHF': {'spread_max': 2.0, 'sesion': 'LDN_NY', 'pts_min': 50},
-        'EURJPY': {'spread_max': 3.0, 'sesion': 'TOK_LDN', 'pts_min': 50},
-        'GBPJPY': {'spread_max': 3.0, 'sesion': 'TOK_LDN', 'pts_min': 50},
-        'XAGUSD': {'spread_max': 3.0, 'sesion': 'TOK_LDN', 'pts_min': 50},
+        'EURGBP': {'spread_max': 2.0, 'sesion': 'LDN_NY', 'pts_min': 50},
+        'EURJPY': {'spread_max': 3.0, 'sesion': 'LDN_NY', 'pts_min': 50},
+        'GBPJPY': {'spread_max': 3.0, 'sesion': 'LDN_NY', 'pts_min': 50},
+        'AUDJPY': {'spread_max': 3.0, 'sesion': 'LDN_NY', 'pts_min': 50},
+        'XAGUSD': {'spread_max': 3.0, 'sesion': 'LDN_NY', 'pts_min': 50},
         'XAUUSD': {'spread_max': 30.0, 'sesion': 'LDN_NY', 'pts_min': 55},
         'US30': {'spread_max': 5.0, 'sesion': 'NY', 'pts_min': 55},
         'NAS100': {'spread_max': 5.0, 'sesion': 'NY', 'pts_min': 55},
         'US500': {'spread_max': 5.0, 'sesion': 'NY', 'pts_min': 55},
         'BTCUSD': {'spread_max': 50.0, 'sesion': '24/7', 'pts_min': 60},
         'ETHUSD': {'spread_max': 5.0, 'sesion': '24/7', 'pts_min': 60},
+        'SOLUSD': {'spread_max': 5.0, 'sesion': '24/7', 'pts_min': 60},
     }
     
     # ============================================================

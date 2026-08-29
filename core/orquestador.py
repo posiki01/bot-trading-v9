@@ -63,7 +63,6 @@ from trading.operabilidad import DecisorOperabilidad, create_decisor_operabilida
 from trading.modos import ModoSelector
 from trading.timer import EntryTimer
 from trading.monitoreo import MonitorPosiciones, create_monitor_posiciones
-from trading.decision_cierre import DecisorCierre, create_decisor_cierre
 
 from data.almacenamiento_sqlite import AlmacenamientoSQLite
 from mt5.conector_mt5 import ConectorPepperstone, ConectorHeadless
@@ -409,9 +408,6 @@ class Orquestador:
     def _inicializar_monitor(self):
         """Inicializa el monitor de posiciones con correcciones V9.3."""
         # ✅ DECISOR DE CIERRE (CORREGIDO)
-        self.decisor_cierre = create_decisor_cierre(
-            analisis_capas=self.analisis_capas
-        )
         
         # ✅ MONITOR DE POSICIONES (CORREGIDO)
         self.monitor_posiciones = create_monitor_posiciones(
@@ -419,7 +415,6 @@ class Orquestador:
             mt5=self.mt5,
             gestion_riesgo=self.gestion_riesgo,
             trailing_engine=self.trailing_engine,
-            decisor_cierre=self.decisor_cierre,
             monitorear_manuales=False  # ✅ Nueva bandera
         )
         
@@ -744,6 +739,7 @@ class Orquestador:
         """
         Precarga el análisis de un símbolo individual.
         V9.10 - NUEVO: Para re-analizar símbolos después de degradación.
+        V9.2 - CORREGIDO: try/except en todos los pasos.
         """
         try:
             self.logger.info(f"📊 Precargando {simbolo}...")
@@ -831,7 +827,7 @@ class Orquestador:
                 return
             
             # ============================================================
-            # CALCULAR SCORE Y RÉGIMEN
+            # CALCULAR SCORE Y RÉGIMEN (✅ CON try/except)
             # ============================================================
             score_h1 = self.score_engine.calcular_score_h1(
                 score_estructura=pesado.score_estructura,
@@ -841,11 +837,17 @@ class Orquestador:
                 simbolo=simbolo
             ).score
             
-            # Clasificar régimen
-            regimen_data = self.regimen_filter.clasificar(simbolo, df_h4, df_h1)
-            regimen = regimen_data.regimen.value
-            direccion_regimen = regimen_data.direccion_favor
-            confianza_regimen = regimen_data.confianza
+            # ✅ CORREGIDO V9.2: Proteger clasificación de régimen
+            try:
+                regimen_data = self.regimen_filter.clasificar(simbolo, df_h4, df_h1)
+                regimen = regimen_data.regimen.value
+                direccion_regimen = regimen_data.direccion_favor
+                confianza_regimen = regimen_data.confianza
+            except Exception as e:
+                self.logger.warning(f"⚠️ {simbolo}: Error clasificando régimen: {e}")
+                regimen = 'UNCERTAIN'
+                direccion_regimen = 'NONE'
+                confianza_regimen = 0
             
             # ============================================================
             # DETERMINAR DIRECCIÓN
@@ -859,7 +861,7 @@ class Orquestador:
             )
             
             # ============================================================
-            # GUARDAR EN PIPELINE
+            # GUARDAR EN PIPELINE (✅ CON try/except)
             # ============================================================
             contexto_h1 = {
                 'score': score_h1,
@@ -884,18 +886,21 @@ class Orquestador:
                 }
             }
             
-            self.pipeline.actualizar_fase_1(
-                simbolo=simbolo,
-                analisis={'rapido': rapido, 'medio': medio, 'pesado': pesado},
-                score=score_h1,
-                direccion=direccion,
-                regimen=regimen,
-                direccion_regimen=direccion_regimen,
-                confianza_regimen=confianza_regimen,
-                tendencia_h4='ALCISTA' if medio.adx > 25 and medio.sma20 > medio.sma50 else 'BAJISTA' if medio.adx > 25 else 'LATERAL',
-                contexto_h1=contexto_h1,
-                analisis_pesado=pesado
-            )
+            try:
+                self.pipeline.actualizar_fase_1(
+                    simbolo=simbolo,
+                    analisis={'rapido': rapido, 'medio': medio, 'pesado': pesado},
+                    score=score_h1,
+                    direccion=direccion,
+                    regimen=regimen,
+                    direccion_regimen=direccion_regimen,
+                    confianza_regimen=confianza_regimen,
+                    tendencia_h4='ALCISTA' if medio.adx > 25 and medio.sma20 > medio.sma50 else 'BAJISTA' if medio.adx > 25 else 'LATERAL',
+                    contexto_h1=contexto_h1,
+                    analisis_pesado=pesado
+                )
+            except Exception as e:
+                self.logger.warning(f"⚠️ {simbolo}: Error actualizando pipeline: {e}")
             
             self.logger.info(f"✅ {simbolo}: Precargado - {len(soportes)} soportes, {len(resistencias)} resistencias, score={score_h1:.1f}")
             
@@ -1829,145 +1834,179 @@ class Orquestador:
     def _evaluar_oportunidad_con_vela_virtual(self, estado):
         """
         Evalúa una oportunidad usando una vela virtual con precio en tiempo real.
-        V9.35 - REFACTORIZADO: Registra fallos y degrada después de 10 intentos.
+        V9.65 - REFACTORIZADO DEFINITIVO:
+        - Ejecuta operación PRIMERO y solo marca como ejecutada si fue exitosa
+        - NO marca como ejecutada si la operación falló
+        V9.2 - CORREGIDO: try/except en todos los pasos críticos.
         """
         simbolo = estado.simbolo
         from analysis.pipeline import FaseOportunidad
         
         self.logger.info(f"🔍 INICIANDO EVALUACIÓN DE {simbolo} CON VELA VIRTUAL")
-         # ✅ CORREGIDO V9.57: VERIFICAR POSICIONES EXISTENTES
-        if not self.modo_backtest:
-            posiciones = self.mt5.obtener_posiciones()
-            if posiciones and any(p['simbolo'] == simbolo for p in posiciones):
-                self.logger.info(f"⏭️ {simbolo}: ya hay posición abierta")
+        
+        try:
+            # ✅ VERIFICAR POSICIONES EXISTENTES
+            if not self.modo_backtest:
+                posiciones = self.mt5.obtener_posiciones()
+                if posiciones and any(p['simbolo'] == simbolo for p in posiciones):
+                    self.logger.info(f"⏭️ {simbolo}: ya hay posición abierta")
+                    return
+            
+            # ✅ Verificar que esté en FASE_3
+            if estado.fase_actual != FaseOportunidad.FASE_3:
+                self.logger.info(f"⏭️ {simbolo}: no está en FASE_3 (actual: {estado.fase_actual.value})")
                 return
-        # ✅ Verificar que esté en FASE_3
-        if estado.fase_actual != FaseOportunidad.FASE_3:
-            self.logger.info(f"⏭️ {simbolo}: no está en FASE_3 (actual: {estado.fase_actual.value})")
-            return
-        
-        # ============================================================
-        # ✅ CORRECCIÓN V9.15: Verificar operabilidad por símbolo
-        # ============================================================
-        es_operativo, razon_horario = self.horario.es_horario_operativo(simbolo)
-        
-        if not es_operativo:
-            self.logger.info(f"⏭️ {simbolo}: NO OPERABLE ({razon_horario})")
-            return
-        
-        # Verificar cooldown
-        if simbolo in self.estado.sniper_cooldown:
-            if datetime.now(timezone.utc) < self.estado.sniper_cooldown[simbolo]:
-                self.logger.info(f"⏭️ {simbolo}: en cooldown hasta {self.estado.sniper_cooldown[simbolo]}")
+            
+            # ✅ Verificar operabilidad por símbolo
+            es_operativo, razon_horario = self.horario.es_horario_operativo(simbolo)
+            if not es_operativo:
+                self.logger.info(f"⏭️ {simbolo}: NO OPERABLE ({razon_horario})")
                 return
-        
-        # Verificar posición abierta
-        if not self.modo_backtest:
-            posiciones = self.mt5.obtener_posiciones()
-            if posiciones and any(p['simbolo'] == simbolo for p in posiciones):
-                self.logger.info(f"⏭️ {simbolo}: ya hay posición abierta")
+            
+            # ✅ Verificar cooldown
+            if simbolo in self.estado.sniper_cooldown:
+                if datetime.now(timezone.utc) < self.estado.sniper_cooldown[simbolo]:
+                    self.logger.info(f"⏭️ {simbolo}: en cooldown hasta {self.estado.sniper_cooldown[simbolo]}")
+                    return
+            
+            # ✅ Verificar posición en memoria
+            if hasattr(self, 'estado') and self.estado.posiciones_abiertas:
+                for ticket, meta in self.estado.posiciones_abiertas.items():
+                    if meta.get('simbolo') == simbolo:
+                        self.logger.info(f"⏭️ {simbolo}: ya hay posición en memoria (Ticket: {ticket})")
+                        return
+            
+            # ✅ Verificar dirección
+            if estado.direccion == 'NEUTRAL':
+                self.logger.info(f"⏭️ {simbolo}: dirección NEUTRAL")
                 return
-        
-        # Verificar dirección
-        if estado.direccion == 'NEUTRAL':
-            self.logger.info(f"⏭️ {simbolo}: dirección NEUTRAL")
-            return
-        
-        # Verificar score
-        if estado.score_acumulado < 30:
-            self.logger.info(f"⏭️ {simbolo}: score insuficiente ({estado.score_acumulado:.1f} < 30)")
-            return
-        
-        # ✅ OBTENER DATOS M5 CON VELA VIRTUAL
-        self.logger.info(f"📥 {simbolo}: Obteniendo datos M5 con vela virtual...")
-        df_m5 = self._obtener_df_m5_con_precio_real(simbolo)
-        
-        if df_m5 is None or len(df_m5) < 50:
-            self.logger.info(f"⏭️ {simbolo}: datos M5 insuficientes o no se pudo crear vela virtual")
-            return
-        
-        self.logger.info(f"✅ {simbolo}: Datos M5 obtenidos ({len(df_m5)} velas, incluyendo vela virtual)")
-        
-        # Precio para análisis técnico: mid-price de la vela virtual.
-        precio_actual = float(df_m5['Close'].iloc[-1])
-        tick_data = df_m5.attrs.get('precio_tick')
-        
-        if tick_data:
-            precio_entrada = float(
-                tick_data.get(
-                    'ask' if estado.direccion == 'COMPRA' else 'bid',
-                    precio_actual
+            
+            # ✅ Verificar score
+            if estado.score_acumulado < 30:
+                self.logger.info(f"⏭️ {simbolo}: score insuficiente ({estado.score_acumulado:.1f} < 30)")
+                return
+            
+            # ✅ OBTENER CONTEXTO H1
+            contexto_h1 = estado.contexto_h1 if estado and hasattr(estado, 'contexto_h1') and estado.contexto_h1 is not None else {}
+            self.logger.info(f"📊 {simbolo}: Contexto H1 obtenido: {len(contexto_h1)} campos")
+            
+            # ✅ OBTENER DATOS M5 CON VELA VIRTUAL
+            df_m5 = self._obtener_df_m5_con_precio_real(simbolo)
+            if df_m5 is None or len(df_m5) < 50:
+                self.logger.info(f"⏭️ {simbolo}: datos M5 insuficientes o no se pudo crear vela virtual")
+                return
+            
+            # ✅ OBTENER DATOS H1 PARA ANÁLISIS MEDIO/PESADO
+            df_h1 = self.cache.get_datos(
+                simbolo=simbolo,
+                timeframe=60,
+                n_velas=250,
+                fetch_func=self.mt5.obtener_datos
+            )
+            
+            # ✅ Ejecutar análisis medio H1 (para pasarlo al sniper)
+            analisis_h1 = None
+            if df_h1 is not None and len(df_h1) > 50:
+                try:
+                    analisis_rapido_h1 = self.analisis_capas.analisis_rapido(df_h1, simbolo)
+                    if analisis_rapido_h1.pasa_filtro:
+                        analisis_h1 = self.analisis_capas.analisis_medio(df_h1, simbolo, analisis_rapido_h1, contexto_h1.get('niveles', {}))
+                except Exception as e:
+                    self.logger.warning(f"⚠️ {simbolo}: Error en análisis H1: {e}")
+            
+            # Precio para análisis técnico: mid-price de la vela virtual
+            precio_actual = float(df_m5['Close'].iloc[-1])
+            tick_data = df_m5.attrs.get('precio_tick')
+            
+            if tick_data:
+                precio_entrada = float(
+                    tick_data.get('ask' if estado.direccion == 'COMPRA' else 'bid', precio_actual)
                 )
-            )
-            digits = int(tick_data.get('digits', 5) or 5)
-            self.logger.info(
-                f"💹 {simbolo}: Precio análisis(mid)={precio_actual:.{digits}f} | "
-                f"Precio entrada={precio_entrada:.{digits}f}"
-            )
-        else:
-            precio_entrada = precio_actual
-            self.logger.info(
-                f"💹 {simbolo}: Precio actual de vela virtual: "
-                f"{precio_actual:.5f}"
-            )
-        
-        # Obtener contexto H1
-        contexto_h1 = estado.contexto_h1 if estado and hasattr(estado, 'contexto_h1') and estado.contexto_h1 is not None else {}
-        
-        self.logger.info(f"🔍 Ejecutando sniper para {simbolo} con vela virtual...")
-        
-        # ✅ Evaluar sniper con la vela virtual
-        resultado = self.sniper_checklist.evaluar_sniper_optimizado(
-            simbolo=simbolo,
-            df_m5=df_m5,
-            precio_actual=precio_actual,
-            direccion=estado.direccion,
-            estado_pipeline=estado,
-            analisis_rapido=None,
-            analisis_medio=None,
-            ejecutar_pesado=True,
-            contexto_h1=contexto_h1,
-            calidad_horario='REGULAR',
-            tick_data=tick_data,
-            precio_entrada=precio_entrada
-        )
-        
-        if resultado:
-            self.logger.info(f"🎯 {simbolo}: ¡OPORTUNIDAD DETECTADA! Modo: {resultado.get('modo', 'N/A')}")
-            
-            # ✅ REINICIAR CONTADOR DE FALLOS
-            estado.metadata['sniper_fallos'] = 0
-            estado.metadata['sniper_ultimo_exito'] = datetime.now(timezone.utc).isoformat()
-            self.pipeline._guardar_estados_en_sqlite()
-            
-            # Ejecutar operación
-            self.ejecutor.ejecutar(resultado)
-            
-            # Marcar pipeline
-            self.pipeline.marcar_ejecutada(simbolo)
-            
-        else:
-            # ✅ NUEVO: Registrar fallo y actualizar timestamp
-            self.logger.info(f"⏭️ {simbolo}: oportunidad rechazada por sniper")
-            
-            fallos = estado.metadata.get('sniper_fallos', 0) + 1
-            estado.metadata['sniper_fallos'] = fallos
-            estado.metadata['sniper_ultimo_fallo'] = datetime.now(timezone.utc).isoformat()
-            estado.timestamp_ultima_actualizacion = datetime.now(timezone.utc)
-            
-            self.pipeline._guardar_estados_en_sqlite()
-            
-            # ✅ DEGRADAR DESPUÉS DE 10 FALLOS CONSECUTIVOS
-            if fallos >= 10:
-                self.logger.info(f"⬇️ {simbolo}: Degradando por {fallos} fallos consecutivos de sniper")
-                self.pipeline._degradar_oportunidad(
-                    simbolo,
-                    razon=f"Demasiados fallos de sniper ({fallos})"
-                )
-                # El método _degradar_oportunidad ya llama a _precargar_simbolo
+                digits = int(tick_data.get('digits', 5) or 5)
+                self.logger.info(f"💹 {simbolo}: Precio análisis(mid)={precio_actual:.{digits}f} | Precio entrada={precio_entrada:.{digits}f}")
             else:
-                self.logger.debug(f"📝 {simbolo}: Fallos sniper: {fallos}/10")
-    
+                precio_entrada = precio_actual
+                self.logger.info(f"💹 {simbolo}: Precio actual de vela virtual: {precio_actual:.5f}")
+            
+            # ✅ Ejecutar sniper con la vela virtual
+            try:
+                resultado = self.sniper_checklist.evaluar_sniper_optimizado(
+                    simbolo=simbolo,
+                    df_m5=df_m5,
+                    precio_actual=precio_actual,
+                    direccion=estado.direccion,
+                    estado_pipeline=estado,
+                    analisis_rapido=None,
+                    analisis_medio=analisis_h1,
+                    ejecutar_pesado=False,
+                    contexto_h1=contexto_h1,
+                    calidad_horario='REGULAR',
+                    tick_data=tick_data,
+                    precio_entrada=precio_entrada
+                )
+            except Exception as e:
+                self.logger.warning(f"⚠️ {simbolo}: Error en sniper: {e}")
+                resultado = None
+            
+            if resultado:
+                self.logger.info(f"🎯 {simbolo}: ¡OPORTUNIDAD DETECTADA! Modo: {resultado.get('modo', 'N/A')}")
+                
+                # ✅ CRÍTICO: Ejecutar operación PRIMERO
+                try:
+                    exito = self.ejecutor.ejecutar(resultado)
+                except Exception as e:
+                    self.logger.error(f"❌ {simbolo}: Error ejecutando operación: {e}")
+                    exito = False
+                
+                if exito:
+                    # ✅ Solo marcar como ejecutada si la ejecución fue exitosa
+                    try:
+                        self.pipeline.marcar_ejecutada(simbolo)
+                        estado.metadata['sniper_fallos'] = 0
+                        estado.metadata['sniper_ultimo_exito'] = datetime.now(timezone.utc).isoformat()
+                        self.logger.info(f"✅ {simbolo}: Operación EJECUTADA correctamente")
+                    except Exception as e:
+                        self.logger.warning(f"⚠️ {simbolo}: Error marcando como ejecutada: {e}")
+                else:
+                    # ✅ Si falló la ejecución, NO marcar como ejecutada
+                    self.logger.warning(f"⚠️ {simbolo}: Ejecución fallida, NO se marca como ejecutada")
+                    estado.metadata['sniper_fallos'] = estado.metadata.get('sniper_fallos', 0) + 1
+                    estado.metadata['sniper_ultimo_fallo'] = datetime.now(timezone.utc).isoformat()
+                    estado.timestamp_ultima_actualizacion = datetime.now(timezone.utc)
+                
+                try:
+                    self.pipeline._guardar_estados_en_sqlite()
+                except Exception as e:
+                    self.logger.warning(f"⚠️ {simbolo}: Error guardando en SQLite: {e}")
+                
+            else:
+                # ✅ NUEVO: Registrar fallo y actualizar timestamp
+                self.logger.info(f"⏭️ {simbolo}: oportunidad rechazada por sniper")
+                
+                fallos = estado.metadata.get('sniper_fallos', 0) + 1
+                estado.metadata['sniper_fallos'] = fallos
+                estado.metadata['sniper_ultimo_fallo'] = datetime.now(timezone.utc).isoformat()
+                estado.timestamp_ultima_actualizacion = datetime.now(timezone.utc)
+                
+                try:
+                    self.pipeline._guardar_estados_en_sqlite()
+                except Exception as e:
+                    self.logger.warning(f"⚠️ {simbolo}: Error guardando en SQLite: {e}")
+                
+                # ✅ DEGRADAR DESPUÉS DE 10 FALLOS CONSECUTIVOS
+                if fallos >= 10:
+                    self.logger.info(f"⬇️ {simbolo}: Degradando por {fallos} fallos consecutivos de sniper")
+                    try:
+                        self.pipeline._degradar_oportunidad(
+                            simbolo,
+                            razon=f"Demasiados fallos de sniper ({fallos})"
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"⚠️ {simbolo}: Error degradando: {e}")
+        
+        except Exception as e:
+            self.logger.error(f"❌ {simbolo}: Error en evaluación con vela virtual: {e}", exc_info=True)
+                
     def _evaluar_oportunidad(self, estado):
         """
         Evalúa una oportunidad específica y loggea el resultado.

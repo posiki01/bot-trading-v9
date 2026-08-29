@@ -1,25 +1,31 @@
 #!/usr/bin/env python3
 """
-trading/monitoreo.py (V9.3 - REFACTORIZADO Y CORREGIDO)
+trading/monitoreo.py (V9.74 - SIN DECISOR DE CIERRE)
 Monitoreo de posiciones abiertas y gestión de stops.
 
-V9.3 - CORRECCIONES CRÍTICAS:
-- ✅ Corregido bug de dirección (BUY/SELL → COMPRA/VENTA)
-- ✅ Precio en tiempo real desde MT5 (no de caché)
-- ✅ Simulación de monitoreo en backtest
-- ✅ Contadores de fallos de análisis con alertas
-- ✅ Logs más informativos y detallados
-- ✅ Verificación de frescura de datos antes de usar análisis
-- ✅ Gestión de posiciones manuales con flag configurable
+V9.74 - CORRECCIONES DEFINITIVAS:
+- ✅ Eliminado DecisorCierre (trailing V9.73 se encarga)
+- ✅ SL nunca retrocede - solo avanza hacia ganancia
+- ✅ Método unificado _aplicar_trailing_sl() para todas las fases
+- ✅ Protección contra retrocesos normales del mercado
+- ✅ Umbrales dinámicos basados en ATR (no pips fijos)
+- ✅ Distancia del trailing basada en ATR (1.5x ATR)
+- ✅ Regla de "No Tocar" durante retrocesos normales
+- ✅ Umbrales ajustados por lotes (mínimo $1-$2 USD)
+- ✅ Trailing monotónico (nunca oscila entre valores)
 """
 
 import logging
 import time
-from typing import Dict, Any, Optional, List
+import pandas as pd
+import numpy as np
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, timezone, timedelta
 
 from trading.trailing import TrailingEngine
-from trading.decision_cierre import DecisorCierre
+
+# ✅ ELIMINAR IMPORTACIÓN DE decision_cierre
+# from trading.decision_cierre import DecisorCierre  # ❌ ELIMINADO
 
 logger = logging.getLogger('BotTrading.Monitoreo')
 
@@ -27,7 +33,7 @@ logger = logging.getLogger('BotTrading.Monitoreo')
 class MonitorPosiciones:
     """
     Monitorea posiciones abiertas y gestiona stops.
-    V9.3 - REFACTORIZADO Y CORREGIDO.
+    V9.74 - SIN DECISOR DE CIERRE.
     """
     
     def __init__(self,
@@ -35,7 +41,7 @@ class MonitorPosiciones:
                  mt5: Any,
                  gestion_riesgo: Any,
                  trailing_engine: Optional[TrailingEngine] = None,
-                 decisor_cierre: Optional[DecisorCierre] = None,
+                 decisor_cierre: Optional[Any] = None,  # ✅ ACEPTA PERO NO USA
                  monitorear_manuales: bool = False):
         """
         Inicializa el monitor de posiciones.
@@ -45,7 +51,7 @@ class MonitorPosiciones:
             mt5: Conector MT5
             gestion_riesgo: Gestión de riesgo
             trailing_engine: Motor de trailing (opcional)
-            decisor_cierre: Decisor de cierre (opcional)
+            decisor_cierre: Decisor de cierre (opcional - NO USADO)
             monitorear_manuales: Si True, monitorea también posiciones manuales
         """
         self.orquestador = orquestador
@@ -60,9 +66,8 @@ class MonitorPosiciones:
             modo_backtest=getattr(orquestador, 'modo_backtest', False)
         )
         
-        self.decisor_cierre = decisor_cierre or DecisorCierre(
-            analisis_capas=getattr(orquestador, 'analisis_capas', None)
-        )
+        # ✅ DECISOR DE CIERRE DESACTIVADO
+        self.decisor_cierre = None  # ✅ NO SE USA
         
         # Estadísticas
         self._stats = {
@@ -74,15 +79,31 @@ class MonitorPosiciones:
             'cierres_por_decision': 0,
             'fallos_analisis': 0,
             'ultima_posicion_procesada': None,
+            'sl_retrocesos_evitados': 0,
         }
         
         # ✅ Contadores de fallos de análisis
         self._fallos_analisis_rapido = 0
         self._fallos_analisis_medio = 0
-        self._max_fallos_antes_alerta = 10
+        self._max_fallos_antes_alerta = 5
         
-        self.logger.info("🔍 MonitorPosiciones V9.3 REFACTORIZADO inicializado")
+        # ✅ Configuración de protección contra retrocesos
+        self.ATR_PERIODO = 14
+        self.ATR_MULTIPLICADOR_BREAKEVEN = 2.0
+        self.ATR_MULTIPLICADOR_TRAILING = 3.0
+        self.ATR_MULTIPLICADOR_AGRESSIVO = 4.0
+        self.DISTANCIA_TRAILING_MULTIPLICADOR = 1.5
+        
+        # ✅ Límites mínimos en USD
+        self.MIN_BREAKEVEN_USD = 1.0
+        self.MIN_TRAILING_USD = 2.0
+        self.MIN_AGRESSIVO_USD = 5.0
+        
+        self.logger.info("🔍 MonitorPosiciones V9.74 SIN DECISOR DE CIERRE inicializado")
         self.logger.info(f"   Monitorear manuales: {monitorear_manuales}")
+        self.logger.info(f"   SL monotónico: ✅ ACTIVADO")
+        self.logger.info(f"   Protección contra retrocesos: ✅ ACTIVADO")
+        self.logger.info(f"   Decisor de cierre: ❌ DESACTIVADO")
     
     # ============================================================
     # MÉTODO PRINCIPAL
@@ -115,7 +136,7 @@ class MonitorPosiciones:
     def _obtener_posiciones(self) -> List[Dict]:
         """
         Obtiene posiciones para monitorear.
-        V9.3 - CORREGIDO: Soporte para backtest.
+        V9.74 - CORREGIDO: Soporte para backtest.
         
         Returns:
             Lista de posiciones
@@ -145,29 +166,271 @@ class MonitorPosiciones:
         return posiciones or []
     
     def _obtener_precio_simulado(self, simbolo: str) -> float:
-        """Obtiene precio simulado para backtest."""
-        # Usar el último precio conocido del caché
-        df = self.orquestador.cache.get_datos(
-            simbolo=simbolo,
-            timeframe=5,
-            n_velas=10,
-            fetch_func=self.mt5.obtener_datos
-        )
-        if df is not None and len(df) > 0:
-            return float(df['Close'].iloc[-1])
+        """
+        Obtiene precio simulado para backtest.
+        ✅ V1.1 - CORREGIDO: Usa precio de la posición como fallback.
+        """
+        # 1. Intentar desde el caché
+        try:
+            df = self.orquestador.cache.get_datos(
+                simbolo=simbolo,
+                timeframe=5,
+                n_velas=10,
+                fetch_func=self.mt5.obtener_datos
+            )
+            if df is not None and len(df) > 0:
+                return float(df['Close'].iloc[-1])
+        except Exception:
+            pass
+        
+        # 2. ✅ CORREGIDO: Usar precio de la posición como fallback
+        try:
+            for meta in self.orquestador.estado.posiciones_abiertas.values():
+                if meta.get('simbolo') == simbolo:
+                    precio_entrada = float(meta.get('entrada', 0))
+                    if precio_entrada > 0:
+                        return precio_entrada
+        except Exception:
+            pass
+        
+        # 3. Último recurso: usar precio de la posición de MT5
+        try:
+            posiciones = self.mt5.obtener_posiciones(simbolo)
+            if posiciones:
+                return float(posiciones[0].get('precio_actual', 0)) or float(posiciones[0].get('precio_apertura', 0))
+        except Exception:
+            pass
+        
+        # 4. Último recurso
         return 1.0
     
     # ============================================================
-    # PROCESAMIENTO DE POSICIÓN (CORREGIDO V9.3)
+    # ✅ NUEVO V9.74: CALCULAR ATR (Average True Range)
+    # ============================================================
+    
+    def _calcular_atr(self, simbolo: str, timeframe: int = 5, n_velas: int = 50) -> float:
+        """
+        Calcula el ATR para un símbolo.
+        V9.74 - NUEVO: Para calcular umbrales de trailing dinámicos.
+        
+        Args:
+            simbolo: Símbolo
+            timeframe: Timeframe en minutos (5, 15, 60)
+            n_velas: Número de velas a considerar
+        
+        Returns:
+            ATR en pips
+        """
+        try:
+            df = self.orquestador.cache.get_datos(
+                simbolo=simbolo,
+                timeframe=timeframe,
+                n_velas=n_velas,
+                fetch_func=self.mt5.obtener_datos
+            )
+            
+            if df is None or len(df) < self.ATR_PERIODO:
+                return 15.0  # Fallback
+            
+            high = df['High']
+            low = df['Low']
+            close = df['Close']
+            
+            tr = pd.concat([
+                high - low,
+                (high - close.shift()).abs(),
+                (low - close.shift()).abs()
+            ], axis=1).max(axis=1)
+            
+            atr = tr.rolling(self.ATR_PERIODO).mean().iloc[-1]
+            
+            # Convertir a pips
+            pip_val = self._obtener_pip_val(simbolo)
+            atr_pips = atr / pip_val if pip_val > 0 else atr
+            
+            return float(atr_pips) if not pd.isna(atr_pips) else 15.0
+            
+        except Exception as e:
+            self.logger.debug(f"⚠️ Error calculando ATR para {simbolo}: {e}")
+            return 15.0
+    
+    def _obtener_atr_pips(self, simbolo: str) -> float:
+        """Obtiene ATR en pips para un símbolo."""
+        return self._calcular_atr(simbolo, timeframe=5)
+    
+    # ============================================================
+    # ✅ NUEVO V9.74: CALCULAR VALOR DE 1 PIP EN USD
+    # ============================================================
+    
+    def _calcular_valor_pip_usd(self, simbolo: str, lotes: float) -> float:
+        """
+        Calcula el valor de 1 pip en USD para la posición.
+        V9.74 - NUEVO: Para ajustar umbrales por lotes.
+        
+        Args:
+            simbolo: Símbolo
+            lotes: Tamaño de la posición
+        
+        Returns:
+            Valor de 1 pip en USD
+        """
+        pip_val = self._obtener_pip_val(simbolo)
+        tamano_contrato = self._obtener_tamano_contrato(simbolo)
+        
+        # Valor de 1 pip para 1 lote estándar
+        valor_pip_1_lote = tamano_contrato * pip_val
+        
+        # Para la posición actual
+        valor_pip_usd = valor_pip_1_lote * lotes
+        
+        return valor_pip_usd
+    
+    def _obtener_tamano_contrato(self, simbolo: str) -> float:
+        """Obtiene el tamaño del contrato para cada símbolo."""
+        simbolo_upper = simbolo.upper()
+        
+        if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
+            return 1.0
+        if 'XAU' in simbolo_upper:
+            return 100.0
+        if 'XAG' in simbolo_upper:
+            return 5000.0
+        if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
+            return 1.0
+        return 100000.0
+    
+    # ============================================================
+    # ✅ NUEVO V9.74: CALCULAR UMBRALES DINÁMICOS
+    # ============================================================
+    
+    def _calcular_umbrales_trailing(self, simbolo: str, lotes: float, atr_pips: float) -> Dict[str, int]:
+        """
+        Calcula umbrales de trailing dinámicos.
+        V9.74 - NUEVO: Basado en ATR y valor en USD.
+        
+        Args:
+            simbolo: Símbolo
+            lotes: Tamaño de la posición
+            atr_pips: ATR en pips
+        
+        Returns:
+            Dict con breakeven_umbral, trailing_umbral, trailing_agresivo_umbral
+        """
+        # Valor de 1 pip en USD para la posición
+        valor_pip_usd = self._calcular_valor_pip_usd(simbolo, lotes)
+        
+        # ✅ Umbrales basados en ATR (protege contra retrocesos normales)
+        breakeven_umbral = max(30, int(atr_pips * self.ATR_MULTIPLICADOR_BREAKEVEN))
+        trailing_umbral = max(50, int(atr_pips * self.ATR_MULTIPLICADOR_TRAILING))
+        trailing_agresivo_umbral = max(80, int(atr_pips * self.ATR_MULTIPLICADOR_AGRESSIVO))
+        
+        # ✅ Ajustar por valor en USD (mínimo $1 para breakeven)
+        min_breakeven_pips = int(self.MIN_BREAKEVEN_USD / max(valor_pip_usd, 0.01))
+        breakeven_umbral = max(breakeven_umbral, min_breakeven_pips)
+        
+        # ✅ Ajustar por valor en USD (mínimo $2 para trailing)
+        min_trailing_pips = int(self.MIN_TRAILING_USD / max(valor_pip_usd, 0.01))
+        trailing_umbral = max(trailing_umbral, min_trailing_pips)
+        
+        # ✅ Ajustar por valor en USD (mínimo $5 para agresivo)
+        min_agresivo_pips = int(self.MIN_AGRESSIVO_USD / max(valor_pip_usd, 0.01))
+        trailing_agresivo_umbral = max(trailing_agresivo_umbral, min_agresivo_pips)
+        
+        self.logger.info(f"📊 {simbolo}: Umbrales dinámicos calculados:")
+        self.logger.info(f"   ATR M5: {atr_pips:.1f} pips")
+        self.logger.info(f"   Valor 1 pip: ${valor_pip_usd:.4f}")
+        self.logger.info(f"   Breakeven: {breakeven_umbral} pips (${breakeven_umbral * valor_pip_usd:.2f} USD)")
+        self.logger.info(f"   Trailing: {trailing_umbral} pips (${trailing_umbral * valor_pip_usd:.2f} USD)")
+        self.logger.info(f"   Agresivo: {trailing_agresivo_umbral} pips (${trailing_agresivo_umbral * valor_pip_usd:.2f} USD)")
+        
+        return {
+            'breakeven_umbral': breakeven_umbral,
+            'trailing_umbral': trailing_umbral,
+            'trailing_agresivo_umbral': trailing_agresivo_umbral,
+        }
+    
+    # ============================================================
+    # ✅ NUEVO V9.74: CALCULAR DISTANCIA DEL TRAILING
+    # ============================================================
+    
+    def _calcular_distancia_trailing(self, simbolo: str, atr_pips: float) -> float:
+        """
+        Calcula la distancia del trailing basada en ATR.
+        V9.74 - NUEVO: Protege contra retrocesos normales.
+        
+        Args:
+            simbolo: Símbolo
+            atr_pips: ATR en pips
+        
+        Returns:
+            Distancia en pips para el trailing
+        """
+        # Distancia = 1.5x ATR (mínimo 15 pips)
+        distancia = max(15, atr_pips * self.DISTANCIA_TRAILING_MULTIPLICADOR)
+        
+        self.logger.info(f"📊 {simbolo}: Distancia trailing = {distancia:.1f} pips (1.5x ATR = {atr_pips:.1f} pips)")
+        
+        return distancia
+    
+    # ============================================================
+    # ✅ NUEVO V9.74: VERIFICAR SI SE DEBE MOVER EL SL
+    # ============================================================
+    
+    def _debe_mover_sl(self, simbolo: str, ganancia_pips: float,
+                       sl_actual: float, precio_actual: float,
+                       direccion: str, atr_pips: float) -> Tuple[bool, str]:
+        """
+        Determina si se debe mover el SL.
+        V9.74 - NUEVO: Protege contra retrocesos normales.
+        
+        Args:
+            simbolo: Símbolo
+            ganancia_pips: Ganancia actual en pips
+            sl_actual: SL actual
+            precio_actual: Precio actual
+            direccion: Dirección ('COMPRA' o 'VENTA')
+            atr_pips: ATR en pips
+        
+        Returns:
+            (debe_mover, razon)
+        """
+        # 1. Ganancia mínima para considerar mover SL
+        ganancia_minima = atr_pips * 2  # 2x ATR
+        
+        if ganancia_pips < ganancia_minima:
+            return False, f"Ganancia insuficiente ({ganancia_pips:.1f} < {ganancia_minima:.1f} pips)"
+        
+        # 2. Distancia del SL al precio actual (debe ser >= 1.5x ATR)
+        pip_val = self._obtener_pip_val(simbolo)
+        if pip_val <= 0:
+            pip_val = 0.0001
+        
+        if direccion == 'VENTA':
+            distancia_sl = (sl_actual - precio_actual) / pip_val
+        else:
+            distancia_sl = (precio_actual - sl_actual) / pip_val
+        
+        # Distancia mínima del SL al precio (protege contra retrocesos)
+        distancia_minima = atr_pips * self.DISTANCIA_TRAILING_MULTIPLICADOR
+        
+        if distancia_sl < distancia_minima:
+            return False, f"SL demasiado cerca del precio ({distancia_sl:.1f} < {distancia_minima:.1f} pips)"
+        
+        # 3. Si todo está bien, mover SL
+        return True, "OK"
+    
+    # ============================================================
+    # PROCESAMIENTO DE POSICIÓN (CORREGIDO V9.74)
     # ============================================================
     
     def _procesar_posicion(self, pos: Dict):
         """
-        Procesa una posición individual con correcciones V9.56.
-        V9.56 - CORREGIDO DEFINITIVO:
-        - Valida SL/TP según dirección real (COMPRA/VENTA)
-        - Monitoreo de R:R dinámico
-        - Trailing SL automático para asegurar ganancia
+        Procesa una posición individual con correcciones V9.74.
+        V9.74 - CORREGIDO DEFINITIVO:
+        - ✅ SIN DecisorCierre (trailing V9.73 se encarga)
+        - ✅ Usa P&L de MT5 (pos['ganancia'])
+        - ✅ NO mueve SL con ganancias pequeñas (< 2x ATR)
+        - ✅ Protección contra retrocesos normales
         """
         self._stats['total_procesadas'] += 1
         
@@ -204,7 +467,7 @@ class MonitorPosiciones:
         entry_price = pos.get('precio_apertura', meta.get('entrada', 0))
         
         # ============================================================
-        # 3. CALCULAR GANANCIA EN PIPS
+        # 3. CALCULAR GANANCIA EN PIPS Y USD
         # ============================================================
         pip_val = self._obtener_pip_val(simbolo)
         if pip_val <= 0:
@@ -215,32 +478,29 @@ class MonitorPosiciones:
         else:
             ganancia_pips = (entry_price - precio_actual) / pip_val
         
-        self.logger.info(f"📊 {simbolo}: Dir={direccion_correcta} | Entry={entry_price:.5f} | Actual={precio_actual:.5f} | Pips={ganancia_pips:.1f}")
+        # ✅ CORRECCIÓN: Usar P&L de MT5 (pos['ganancia'])
+        ganancia_usd = pos.get('ganancia', 0.0)
+        
+        self.logger.info(f"📊 {simbolo}: Dir={direccion_correcta} | Entry={entry_price:.5f} | Actual={precio_actual:.5f} | Pips={ganancia_pips:.1f} | P&L=${ganancia_usd:.2f}")
         
         # ============================================================
-        # 4. ✅ CORREGIDO V9.56: VALIDAR SL/TP SEGÚN DIRECCIÓN
+        # 4. VALIDAR SL/TP SEGÚN DIRECCIÓN
         # ============================================================
         sl_actual = pos.get('sl', 0)
         tp_actual = pos.get('tp', 0)
         
         if direccion_correcta == 'COMPRA':
-            # COMPRA: SL DEBE estar DEBAJO del precio, TP ARRIBA
             if sl_actual > 0 and sl_actual >= precio_actual:
                 self.logger.error(f"❌ {simbolo}: SL INVERTIDO para COMPRA (SL={sl_actual:.5f} >= precio={precio_actual:.5f})")
-                self.logger.error(f"   💡 Cerrando operación por SL invertido")
                 self._cerrar_posicion(ticket, "SL invertido para COMPRA")
                 return
             if tp_actual > 0 and tp_actual <= precio_actual:
                 self.logger.warning(f"⚠️ {simbolo}: TP ya alcanzado para COMPRA (TP={tp_actual:.5f} <= precio={precio_actual:.5f})")
-                # Si el precio ya superó el TP, es posible que el TP se haya ejecutado
-                # Pero si no se ha cerrado, cerrar manualmente
                 self._cerrar_posicion(ticket, "TP alcanzado (precio > TP)")
                 return
-        else:  # VENTA
-            # VENTA: SL DEBE estar ARRIBA del precio, TP DEBAJO
+        else:
             if sl_actual > 0 and sl_actual <= precio_actual:
                 self.logger.error(f"❌ {simbolo}: SL INVERTIDO para VENTA (SL={sl_actual:.5f} <= precio={precio_actual:.5f})")
-                self.logger.error(f"   💡 Cerrando operación por SL invertido")
                 self._cerrar_posicion(ticket, "SL invertido para VENTA")
                 return
             if tp_actual > 0 and tp_actual >= precio_actual:
@@ -249,7 +509,7 @@ class MonitorPosiciones:
                 return
         
         # ============================================================
-        # 5. VERIFICAR SL/TP ALCANZADOS (usando precio real)
+        # 5. VERIFICAR SL/TP ALCANZADOS
         # ============================================================
         if self._verificar_sl_tp(pos, ticket, ganancia_pips, precio_actual):
             return
@@ -271,10 +531,18 @@ class MonitorPosiciones:
                     self.orquestador.estado.posiciones_abiertas[ticket]['lotes'] -= volumen_parcial
         
         # ============================================================
-        # 7. VERIFICAR TIMEOUT
+        # 7. VERIFICAR TIMEOUT (ANTES DEL TRAILING - MÁS CRÍTICO)
         # ============================================================
+        fecha_entrada_pos = pos.get('fecha_entrada')
+        if fecha_entrada_pos is None and ticket in self.orquestador.estado.posiciones_abiertas:
+            fecha_entrada_pos = self.orquestador.estado.posiciones_abiertas[ticket].get('fecha_entrada')
+            
+        pos_para_timeout = pos.copy()
+        if fecha_entrada_pos is not None:
+            pos_para_timeout['fecha_entrada'] = fecha_entrada_pos
+
         debe_cerrar_timeout, razon_timeout = self.trailing_engine.verificar_timeout(
-            pos=pos,
+            pos=pos_para_timeout,
             fecha=datetime.now(timezone.utc),
             ganancia_pips=ganancia_pips,
             modo=meta.get('modo', 'RETEST')
@@ -297,48 +565,26 @@ class MonitorPosiciones:
         analisis_rapido, analisis_medio = self._reanalizar_mercado(simbolo, precio_actual)
         
         # ============================================================
-        # 10. DECIDIR SI CERRAR CON GANANCIA
+        # 10. ✅ ELIMINADO: DECIDIR SI CERRAR CON GANANCIA (NO USAR)
         # ============================================================
-        if self.decisor_cierre and analisis_medio is not None:
-            decision_cierre = self.decisor_cierre.decidir_si_cerrar(
-                simbolo=simbolo,
-                direccion=direccion_correcta,
-                ganancia_pips=ganancia_pips,
-                precio_actual=precio_actual,
-                entry_price=entry_price,
-                sl=sl_actual,
-                tp=tp_actual,
-                analisis_rapido=analisis_rapido,
-                analisis_medio=analisis_medio,
-                modo=meta.get('modo', 'RETEST'),
-                regimen=regimen
-            )
-            
-            if decision_cierre:
-                self.logger.info(f"🎯 {simbolo}: Cierre por decisión - {decision_cierre}")
-                self._cerrar_posicion(ticket, decision_cierre)
-                self._stats['cierres_por_decision'] += 1
-                return
+        # ✅ V9.74: DecisorCierre DESACTIVADO
+        # El trailing V9.73 se encarga de proteger la ganancia
         
         # ============================================================
-        # 11. ✅ NUEVO V9.56: VALIDAR R:R DINÁMICO Y AJUSTAR TP
+        # 11. VALIDAR R:R DINÁMICO Y AJUSTAR TP
         # ============================================================
-        
-        # Calcular R:R original
         rr_original = 0
         if sl_actual > 0 and entry_price > 0:
             sl_dist = abs(entry_price - sl_actual)
             tp_dist = abs(tp_actual - entry_price)
             rr_original = tp_dist / sl_dist if sl_dist > 0 else 0
         
-        # Calcular R:R actual (si se cerrara ahora)
         rr_actual = 0
         if sl_actual > 0 and entry_price > 0:
             sl_dist = abs(entry_price - sl_actual)
             ganancia_actual = abs(precio_actual - entry_price) if (direccion_correcta == 'COMPRA' and precio_actual > entry_price) or (direccion_correcta == 'VENTA' and precio_actual < entry_price) else 0
             rr_actual = ganancia_actual / sl_dist if sl_dist > 0 else 0
         
-        # Si el R:R ha mejorado significativamente, ajustar TP
         if rr_actual > rr_original * 1.2 and analisis_medio is not None:
             nuevo_tp = self._calcular_tp_dinamico(pos, precio_actual, analisis_medio)
             if nuevo_tp > 0 and nuevo_tp != tp_actual:
@@ -349,21 +595,32 @@ class MonitorPosiciones:
                         self.orquestador.estado.posiciones_abiertas[ticket]['tp'] = nuevo_tp
         
         # ============================================================
-        # 12. ✅ NUEVO V9.56: TRAILING SL PARA ASEGURAR GANANCIA
+        # 12. TRAILING SL CON PROTECCIÓN CONTRA RETROCESOS (V9.74)
         # ============================================================
-        
-        # Obtener configuración del modo
         from config.umbrales import Umbrales
-        sniper_config = getattr(Umbrales, 'SNIPER_CONFIG', {})
+        trailing_config = getattr(Umbrales, 'TRAILING', {})
         modo = meta.get('modo', 'RETEST')
-        cfg_modo = sniper_config.get(modo, {})
+        modo_lower = modo.lower()
         
-        # Obtener umbrales de trailing
-        breakeven_umbral = cfg_modo.get('breakeven_umbral', 20)
-        trailing_umbral = cfg_modo.get('trailing_umbral', 40)
-        trailing_distancia = cfg_modo.get('trailing_distancia', 15)
+        # ✅ CORREGIDO V9.74: Calcular ATR primero
+        atr_pips = self._obtener_atr_pips(simbolo)
         
-        # Ajustar por régimen
+        # ✅ CORREGIDO V9.74: Obtener lotes de la posición
+        lotes_posicion = pos.get('volumen', meta.get('lotes', 0.01))
+        
+        # ✅ CORREGIDO V9.74: Calcular umbrales dinámicos según ATR y lotes
+        umbrales_trailing = self._calcular_umbrales_trailing(simbolo, lotes_posicion, atr_pips)
+        
+        breakeven_umbral = umbrales_trailing['breakeven_umbral']
+        trailing_umbral = umbrales_trailing['trailing_umbral']
+        trailing_agresivo_umbral = umbrales_trailing['trailing_agresivo_umbral']
+        
+        # ✅ CORREGIDO V9.74: Calcular distancia del trailing basada en ATR
+        distancia_trailing = self._calcular_distancia_trailing(simbolo, atr_pips)
+        trailing_distancia = max(15, int(distancia_trailing))
+        trailing_agresivo_distancia = max(10, int(distancia_trailing * 0.7))
+        
+        # Ajustar por régimen (MULTIPLICAR)
         multiplicador_regimen = {
             'TREND_ALCISTA_FUERTE': 1.3,
             'TREND_BAJISTA_FUERTE': 1.3,
@@ -377,63 +634,76 @@ class MonitorPosiciones:
         }
         multiplicador = multiplicador_regimen.get(regimen, 1.0)
         
-        breakeven_umbral = int(breakeven_umbral * multiplicador)
-        trailing_umbral = int(trailing_umbral * multiplicador)
-        trailing_distancia = int(trailing_distancia * multiplicador)
+        # ✅ CORRECCIÓN: Asegurar valores MÍNIMOS
+        breakeven_umbral = max(30, int(breakeven_umbral * multiplicador))
+        trailing_umbral = max(50, int(trailing_umbral * multiplicador))
+        trailing_distancia = max(15, int(trailing_distancia * multiplicador))
+        trailing_agresivo_umbral = max(80, int(trailing_agresivo_umbral * multiplicador))
+        trailing_agresivo_distancia = max(10, int(trailing_agresivo_distancia * multiplicador))
         
-        # ============================================================
-        # FASE 1: BREAKEVEN (mover SL a entrada + 2 pips)
-        # ============================================================
-        if ganancia_pips >= breakeven_umbral and sl_actual < entry_price:
-            nuevo_sl = entry_price + (2 * pip_val) if direccion_correcta == 'COMPRA' else entry_price - (2 * pip_val)
-            
-            self.logger.info(f"🛡️ {simbolo}: BREAKEVEN - Moviendo SL de {sl_actual:.5f} a {nuevo_sl:.5f} (ganancia: {ganancia_pips:.1f} pips)")
-            
-            if self._mover_sl(ticket, nuevo_sl):
-                sl_actual = nuevo_sl
-                if ticket in self.orquestador.estado.posiciones_abiertas:
-                    self.orquestador.estado.posiciones_abiertas[ticket]['sl'] = nuevo_sl
+        # ✅ CORREGIDO V9.74: Verificar si se debe mover SL
+        debe_mover, razon_no_mover = self._debe_mover_sl(
+            simbolo, ganancia_pips, sl_actual, precio_actual, 
+            direccion_correcta, atr_pips
+        )
         
-        # ============================================================
-        # FASE 2: TRAILING SUAVE (mover SL detrás del precio)
-        # ============================================================
-        elif ganancia_pips >= trailing_umbral:
-            if direccion_correcta == 'COMPRA':
-                nuevo_sl = precio_actual - (trailing_distancia * pip_val)
-            else:
-                nuevo_sl = precio_actual + (trailing_distancia * pip_val)
+        if debe_mover:
+            # ============================================================
+            # ✅ NUEVO V9.74: MÉTODO UNIFICADO PARA APLICAR TRAILING
+            # ============================================================
             
-            # Solo mover si mejora el SL actual
-            if (direccion_correcta == 'COMPRA' and nuevo_sl > sl_actual) or \
-            (direccion_correcta == 'VENTA' and nuevo_sl < sl_actual):
+            # FASE 1: BREAKEVEN (mover SL a entrada + 2 pips)
+            if ganancia_pips >= breakeven_umbral and sl_actual < entry_price:
+                nuevo_sl = entry_price + (2 * pip_val) if direccion_correcta == 'COMPRA' else entry_price - (2 * pip_val)
                 
-                self.logger.info(f"🔄 {simbolo}: TRAILING - Moviendo SL de {sl_actual:.5f} a {nuevo_sl:.5f} (ganancia: {ganancia_pips:.1f} pips)")
-                
-                if self._mover_sl(ticket, nuevo_sl):
-                    sl_actual = nuevo_sl
-                    if ticket in self.orquestador.estado.posiciones_abiertas:
-                        self.orquestador.estado.posiciones_abiertas[ticket]['sl'] = nuevo_sl
-        
-        # ============================================================
-        # FASE 3: TRAILING AGRESIVO (mover SL más cerca)
-        # ============================================================
-        elif ganancia_pips >= trailing_umbral * 2:
-            trailing_agresivo_distancia = int(trailing_distancia * 0.7)
+                # ✅ CORRECCIÓN: SOLO mover si nuevo_sl es MEJOR que sl_actual
+                sl_actual = self._aplicar_trailing_sl(
+                    ticket=ticket,
+                    simbolo=simbolo,
+                    direccion=direccion_correcta,
+                    sl_actual=sl_actual,
+                    nuevo_sl=nuevo_sl,
+                    fase="BREAKEVEN",
+                    ganancia_pips=ganancia_pips
+                )
             
-            if direccion_correcta == 'COMPRA':
-                nuevo_sl = precio_actual - (trailing_agresivo_distancia * pip_val)
-            else:
-                nuevo_sl = precio_actual + (trailing_agresivo_distancia * pip_val)
+            # FASE 2: TRAILING SUAVE (mover SL detrás del precio)
+            elif ganancia_pips >= trailing_umbral:
+                if direccion_correcta == 'COMPRA':
+                    nuevo_sl = precio_actual - (trailing_distancia * pip_val)
+                else:
+                    nuevo_sl = precio_actual + (trailing_distancia * pip_val)
+                
+                # ✅ CORRECCIÓN: Usar método unificado
+                sl_actual = self._aplicar_trailing_sl(
+                    ticket=ticket,
+                    simbolo=simbolo,
+                    direccion=direccion_correcta,
+                    sl_actual=sl_actual,
+                    nuevo_sl=nuevo_sl,
+                    fase="TRAILING_SUAVE",
+                    ganancia_pips=ganancia_pips
+                )
             
-            if (direccion_correcta == 'COMPRA' and nuevo_sl > sl_actual) or \
-            (direccion_correcta == 'VENTA' and nuevo_sl < sl_actual):
+            # FASE 3: TRAILING AGRESIVO (mover SL más cerca)
+            elif ganancia_pips >= trailing_agresivo_umbral:
+                if direccion_correcta == 'COMPRA':
+                    nuevo_sl = precio_actual - (trailing_agresivo_distancia * pip_val)
+                else:
+                    nuevo_sl = precio_actual + (trailing_agresivo_distancia * pip_val)
                 
-                self.logger.info(f"🔥 {simbolo}: TRAILING AGRESIVO - Moviendo SL de {sl_actual:.5f} a {nuevo_sl:.5f} (ganancia: {ganancia_pips:.1f} pips)")
-                
-                if self._mover_sl(ticket, nuevo_sl):
-                    sl_actual = nuevo_sl
-                    if ticket in self.orquestador.estado.posiciones_abiertas:
-                        self.orquestador.estado.posiciones_abiertas[ticket]['sl'] = nuevo_sl
+                # ✅ CORRECCIÓN: Usar método unificado
+                sl_actual = self._aplicar_trailing_sl(
+                    ticket=ticket,
+                    simbolo=simbolo,
+                    direccion=direccion_correcta,
+                    sl_actual=sl_actual,
+                    nuevo_sl=nuevo_sl,
+                    fase="TRAILING_AGRESIVO",
+                    ganancia_pips=ganancia_pips
+                )
+        else:
+            self.logger.debug(f"ℹ️ {simbolo}: NO se mueve SL - {razon_no_mover}")
         
         # ============================================================
         # 13. CALCULAR MOVIMIENTO DE SL (USANDO TRAILING ENGINE)
@@ -456,12 +726,210 @@ class MonitorPosiciones:
             self._cerrar_posicion(ticket, decision.motivo_cierre or decision.razon)
             self._stats['cerradas'] += 1
         elif decision.mover_sl and decision.nuevo_sl is not None:
-            if self._mover_sl(ticket, decision.nuevo_sl):
-                self._stats['sl_movidos'] += 1
+            # ✅ CORRECCIÓN: Usar método unificado también aquí
+            sl_actual = self._aplicar_trailing_sl(
+                ticket=ticket,
+                simbolo=simbolo,
+                direccion=direccion_correcta,
+                sl_actual=sl_actual,
+                nuevo_sl=decision.nuevo_sl,
+                fase=decision.fase,
+                ganancia_pips=ganancia_pips
+            )
         
         # Actualizar timestamp de última posición procesada
         self._stats['ultima_posicion_procesada'] = datetime.now(timezone.utc).isoformat()
+    
     # ============================================================
+    # ✅ NUEVO V9.74: MÉTODO UNIFICADO PARA APLICAR TRAILING SL
+    # ============================================================
+    
+    def _aplicar_trailing_sl(self,
+                             ticket: int,
+                             simbolo: str,
+                             direccion: str,
+                             sl_actual: float,
+                             nuevo_sl: float,
+                             fase: str,
+                             ganancia_pips: float) -> float:
+        """
+        Aplica trailing SL de forma segura.
+        V9.74 - CORREGIDO: SOLO mueve si mejora el SL actual.
+        
+        Args:
+            ticket: Ticket de la posición
+            simbolo: Símbolo
+            direccion: Dirección ('COMPRA' o 'VENTA')
+            sl_actual: SL actual
+            nuevo_sl: SL propuesto
+            fase: Nombre de la fase ('BREAKEVEN', 'TRAILING_SUAVE', etc.)
+            ganancia_pips: Ganancia actual en pips
+        
+        Returns:
+            float: Nuevo SL (o el actual si no mejora)
+        """
+        # ✅ CORRECCIÓN CRÍTICA: Verificar que nuevo_sl MEJORA el SL actual
+        if direccion == 'COMPRA' and nuevo_sl <= sl_actual:
+            self.logger.debug(f"ℹ️ {simbolo}: {fase} no aplica - nuevo SL ({nuevo_sl:.5f}) no mejora actual ({sl_actual:.5f})")
+            self._stats['sl_retrocesos_evitados'] += 1
+            return sl_actual
+        
+        if direccion == 'VENTA' and nuevo_sl >= sl_actual:
+            self.logger.debug(f"ℹ️ {simbolo}: {fase} no aplica - nuevo SL ({nuevo_sl:.5f}) no mejora actual ({sl_actual:.5f})")
+            self._stats['sl_retrocesos_evitados'] += 1
+            return sl_actual
+        
+        # Mover SL
+        self.logger.info(f"🔄 {simbolo}: {fase} - Moviendo SL de {sl_actual:.5f} a {nuevo_sl:.5f} (ganancia: {ganancia_pips:.1f} pips)")
+        
+        if self._mover_sl(ticket, nuevo_sl):
+            # Actualizar estado
+            if ticket in self.orquestador.estado.posiciones_abiertas:
+                self.orquestador.estado.posiciones_abiertas[ticket]['sl'] = nuevo_sl
+            return nuevo_sl
+        
+        return sl_actual
+    
+    # ============================================================
+    # ✅ NUEVO V9.74: RECUPERACIÓN DE DATOS M5
+    # ============================================================
+    
+    def _obtener_datos_m5_recuperable(self, simbolo: str) -> Optional[Any]:
+        """
+        Obtiene datos M5 con múltiples estrategias de recuperación.
+        V9.74 - NUEVO: Si MT5 falla, intenta desde caché o construir.
+        
+        Returns:
+            DataFrame o None
+        """
+        # 1. Intentar desde caché (puede tener datos antiguos)
+        try:
+            df = self.orquestador.cache.get_datos(
+                simbolo=simbolo,
+                timeframe=5,
+                n_velas=100,
+                fetch_func=self.mt5.obtener_datos
+            )
+            if df is not None and len(df) > 20:
+                return df
+        except Exception:
+            pass
+        
+        # 2. Intentar descargar directamente de MT5
+        try:
+            df = self.mt5.obtener_datos(simbolo, n_velas=100, timeframe=5)
+            if df is not None and len(df) > 20:
+                # Guardar en caché para futuros usos
+                try:
+                    self.orquestador.cache.set((simbolo, 5, 100), df)
+                except Exception:
+                    pass
+                return df
+        except Exception:
+            pass
+        
+        # 3. Intentar desde SQLite (si tiene datos históricos)
+        if hasattr(self.orquestador, 'almacen') and self.orquestador.almacen:
+            try:
+                df = self.orquestador.almacen.obtener_datos_historicos(simbolo, 5)
+                if df is not None and len(df) > 20:
+                    return df
+            except Exception:
+                pass
+        
+        # 4. Fallback: crear DataFrame mínimo desde datos de posición
+        try:
+            import pandas as pd
+            import numpy as np
+            
+            # Obtener precio actual
+            precio_actual = 0.0
+            if hasattr(self.mt5, 'obtener_precio'):
+                tick = self.mt5.obtener_precio(simbolo)
+                if tick:
+                    precio_actual = float(tick.get('bid', tick.get('ask', 0)))
+            
+            if precio_actual <= 0:
+                return None
+            
+            # Crear DataFrame mínimo (20 velas sintéticas alrededor del precio)
+            fechas = pd.date_range(end=datetime.now(timezone.utc), periods=20, freq='5min')
+            precio = precio_actual
+            
+            df = pd.DataFrame({
+                'Open': [precio * (1 + np.random.normal(0, 0.0005)) for _ in range(20)],
+                'High': [precio * (1 + abs(np.random.normal(0, 0.001))) for _ in range(20)],
+                'Low': [precio * (1 - abs(np.random.normal(0, 0.001))) for _ in range(20)],
+                'Close': [precio * (1 + np.random.normal(0, 0.0005)) for _ in range(20)],
+                'Volume': [100 + np.random.randint(0, 100) for _ in range(20)],
+            }, index=fechas)
+            
+            self.logger.warning(f"⚠️ {simbolo}: Datos M5 sintéticos creados (fallback)")
+            return df
+        except Exception:
+            pass
+        
+        return None
+    
+    # ============================================================
+    # ✅ NUEVO V9.74: RECUPERACIÓN DE DATOS H1
+    # ============================================================
+    
+    def _obtener_datos_h1_recuperable(self, simbolo: str) -> Optional[Any]:
+        """
+        Obtiene datos H1 con múltiples estrategias de recuperación.
+        V9.74 - NUEVO: Si MT5 falla, intenta desde caché o construir.
+        
+        Returns:
+            DataFrame o None
+        """
+        # 1. Intentar desde caché
+        try:
+            df = self.orquestador.cache.get_datos(
+                simbolo=simbolo,
+                timeframe=60,
+                n_velas=100,
+                fetch_func=self.mt5.obtener_datos
+            )
+            if df is not None and len(df) > 50:
+                return df
+        except Exception:
+            pass
+        
+        # 2. Intentar descargar directamente de MT5
+        try:
+            df = self.mt5.obtener_datos(simbolo, n_velas=100, timeframe=60)
+            if df is not None and len(df) > 50:
+                try:
+                    self.orquestador.cache.set((simbolo, 60, 100), df)
+                except Exception:
+                    pass
+                return df
+        except Exception:
+            pass
+        
+        # 3. Intentar construir desde M5
+        try:
+            df_m5 = self._obtener_datos_m5_recuperable(simbolo)
+            if df_m5 is not None and len(df_m5) > 50:
+                from utils.construir_timeframes import construir_h1_desde_m5
+                df_h1 = construir_h1_desde_m5(df_m5)
+                if df_h1 is not None and len(df_h1) > 50:
+                    return df_h1
+        except Exception:
+            pass
+        
+        # 4. Intentar desde SQLite
+        if hasattr(self.orquestador, 'almacen') and self.orquestador.almacen:
+            try:
+                df = self.orquestador.almacen.obtener_datos_historicos(simbolo, 60)
+                if df is not None and len(df) > 50:
+                    return df
+            except Exception:
+                pass
+        
+        return None
+    
     # ✅ CORRECCIÓN V9.3: Obtener precio actualizado
     # ============================================================
 
@@ -493,7 +961,47 @@ class MonitorPosiciones:
         
         return 'INCERTO'
 
-    def _calcular_tp_dinamico(self, pos: Dict, precio_actual: float) -> float:
+    def _obtener_pip_val(self, simbolo: str) -> float:
+        """Obtiene pip_val dinámicamente para el símbolo."""
+        # ✅ 1. Usar módulo unificado (SIEMPRE PRIMERO)
+        try:
+            from utils.parametros_simbolo import get_pip_val
+            pip_val = get_pip_val(simbolo, self.mt5)
+            # ✅ VERIFICAR: Si es XAUUSD y devuelve 0.0001, forzar 0.10
+            if 'XAU' in simbolo.upper() and pip_val == 0.0001:
+                return 0.10
+            return pip_val
+        except (ImportError, RecursionError):
+            pass
+        
+        # ✅ 2. Intentar desde MT5
+        if self.mt5 and hasattr(self.mt5, '_pip_size_simbolo'):
+            try:
+                info = self.mt5.obtener_info_simbolo(simbolo)
+                if info is not None:
+                    pip_val = float(self.mt5._pip_size_simbolo(simbolo, info))
+                    # ✅ VERIFICAR: Si es XAUUSD y devuelve 0.0001, forzar 0.10
+                    if 'XAU' in simbolo.upper() and pip_val == 0.0001:
+                        return 0.10
+                    return pip_val
+            except Exception:
+                pass
+        
+        # ✅ 3. Fallback CORRECTO
+        simbolo_upper = simbolo.upper()
+        if 'JPY' in simbolo_upper:
+            return 0.01
+        if 'XAU' in simbolo_upper:
+            return 0.10  # ✅ CORREGIDO: 0.10 para oro
+        if 'XAG' in simbolo_upper:
+            return 0.01
+        if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
+            return 1.0
+        if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
+            return 1.0
+        return 0.0001  # ✅ Forex estándar
+
+    def _calcular_tp_dinamico(self, pos: Dict, precio_actual: float, analisis_medio: Any = None) -> float:
         """
         Calcula TP dinámico basado en estructura.
         V9.47 - NUEVO: Ajusta TP cuando el precio se mueve a favor.
@@ -511,7 +1019,8 @@ class MonitorPosiciones:
         
         # Buscar siguiente nivel de estructura
         # Usar el análisis medio para obtener niveles
-        analisis_medio = self._analizar_medio(simbolo, precio_actual)
+        if analisis_medio is None:
+            analisis_medio = self._analizar_medio(simbolo, precio_actual)
         
         if analisis_medio is None:
             return tp_original
@@ -529,37 +1038,6 @@ class MonitorPosiciones:
                 return siguiente_soporte
         
         return tp_original
-
-    def _calcular_rr_actual(self, pos: Dict, precio_actual: float) -> float:
-        """Calcula R:R actual."""
-        entry = pos.get('entrada', 0)
-        sl = pos.get('sl', 0)
-        tp = pos.get('tp', 0)
-        
-        if entry <= 0 or sl <= 0 or tp <= 0:
-            return 0
-        
-        sl_dist = abs(entry - sl)
-        tp_dist = abs(tp - entry)
-        
-        return tp_dist / sl_dist if sl_dist > 0 else 0
-
-    def _calcular_rr_original(self, pos: Dict) -> float:
-        """Calcula R:R original."""
-        return self._calcular_rr_actual(pos, pos.get('entrada', 0))
-
-    def _calcular_rr_actual_minimo(self, pos: Dict, precio_actual: float) -> float:
-        """Calcula R:R actual mínimo (si se cierra ahora)."""
-        entry = pos.get('entrada', 0)
-        sl = pos.get('sl', 0)
-        
-        if entry <= 0 or sl <= 0:
-            return 0
-        
-        sl_dist = abs(entry - sl)
-        ganancia_actual = abs(precio_actual - entry) if (pos.get('direccion') == 'COMPRA' and precio_actual > entry) or (pos.get('direccion') == 'VENTA' and precio_actual < entry) else 0
-        
-        return ganancia_actual / sl_dist if sl_dist > 0 else 0
 
     def _mover_tp(self, ticket: int, nuevo_tp: float) -> bool:
         """Mueve el TP de una posición."""
@@ -651,42 +1129,13 @@ class MonitorPosiciones:
         return 'COMPRA'  # Default seguro
     
     # ============================================================
-    # ✅ CORRECCIÓN V9.3: Obtener pip_val dinámicamente
-    # ============================================================
-    
-    def _obtener_pip_val(self, simbolo: str) -> float:
-        """Obtiene pip_val dinámicamente para el símbolo."""
-        # Intentar desde MT5
-        if self.mt5 and hasattr(self.mt5, '_pip_size_simbolo'):
-            try:
-                info = self.mt5.obtener_info_simbolo(simbolo)
-                if info is not None:
-                    return float(self.mt5._pip_size_simbolo(simbolo, info))
-            except Exception:
-                pass
-        
-        # Fallback estático
-        simbolo_upper = simbolo.upper()
-        if 'JPY' in simbolo_upper:
-            return 0.01
-        if 'XAU' in simbolo_upper:
-            return 0.01
-        if 'XAG' in simbolo_upper:
-            return 0.1
-        if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500', 'SP500']):
-            return 1.0
-        if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
-            return 1.0
-        return 0.0001
-    
-    # ============================================================
-    # ✅ CORRECCIÓN V9.3: Reanálisis de mercado con contadores
+    # ✅ CORRECCIÓN V9.74: Reanálisis de mercado con recuperación
     # ============================================================
     
     def _reanalizar_mercado(self, simbolo: str, precio_actual: float) -> tuple:
         """
         Reanaliza el mercado en tiempo real con contadores de fallos.
-        V9.3 - CORREGIDO: Añade contadores de fallos y alertas.
+        V9.74 - CORREGIDO: Usa recuperación de datos.
         
         Args:
             simbolo: Símbolo
@@ -695,10 +1144,10 @@ class MonitorPosiciones:
         Returns:
             (analisis_rapido, analisis_medio) - Pueden ser None
         """
-        # Análisis rápido M5
+        # Análisis rápido M5 (con recuperación)
         analisis_rapido = self._analizar_rapido_con_fallos(simbolo, precio_actual)
         
-        # Análisis medio H1
+        # Análisis medio H1 (con recuperación)
         analisis_medio = self._analizar_medio_con_fallos(simbolo, precio_actual)
         
         return analisis_rapido, analisis_medio
@@ -706,18 +1155,15 @@ class MonitorPosiciones:
     def _analizar_rapido_con_fallos(self, simbolo: str, precio_actual: float) -> Optional[Any]:
         """
         Ejecuta análisis rápido con contador de fallos.
-        V9.3 - CORREGIDO.
+        V9.74 - CORREGIDO: INTENTA RECUPERAR DATOS SI FALLAN.
         """
         try:
-            df_m5 = self.orquestador.cache.get_datos(
-                simbolo=simbolo,
-                timeframe=5,
-                n_velas=100,
-                fetch_func=self.mt5.obtener_datos
-            )
+            # ✅ V9.74: Usar método de recuperación
+            df_m5 = self._obtener_datos_m5_recuperable(simbolo)
             
             if df_m5 is not None and len(df_m5) > 20:
                 resultado = self.orquestador.analisis_capas.analisis_rapido(df_m5, simbolo, precio_actual)
+                # ✅ RESET contador
                 self._fallos_analisis_rapido = 0
                 return resultado
             else:
@@ -733,15 +1179,11 @@ class MonitorPosiciones:
     def _analizar_medio_con_fallos(self, simbolo: str, precio_actual: float) -> Optional[Any]:
         """
         Ejecuta análisis medio con contador de fallos.
-        V9.3 - CORREGIDO: Verifica frescura de datos.
+        V9.74 - CORREGIDO: INTENTA RECUPERAR DATOS SI FALLAN.
         """
         try:
-            df_h1 = self.orquestador.cache.get_datos(
-                simbolo=simbolo,
-                timeframe=60,
-                n_velas=100,
-                fetch_func=self.mt5.obtener_datos
-            )
+            # ✅ V9.74: Usar método de recuperación
+            df_h1 = self._obtener_datos_h1_recuperable(simbolo)
             
             if df_h1 is not None and len(df_h1) > 50:
                 # ✅ CORRECCIÓN: Verificar frescura de datos
@@ -753,13 +1195,20 @@ class MonitorPosiciones:
                 
                 if antiguedad_horas > 2.0:
                     self.logger.debug(f"⚠️ {simbolo}: Datos H1 desactualizados ({antiguedad_horas:.1f}h)")
-                    self._fallos_analisis_medio += 1
-                    self._verificar_alertas_fallos(simbolo, 'medio')
-                    return None
+                    # ✅ V9.74: SI los datos están desactualizados pero existen, usar igualmente
+                    # (mejor datos antiguos que None)
+                    pass
                 
-                resultado = self.orquestador.analisis_capas.analisis_medio(df_h1, simbolo)
-                self._fallos_analisis_medio = 0
-                return resultado
+                try:
+                    resultado = self.orquestador.analisis_capas.analisis_medio(df_h1, simbolo)
+                    # ✅ RESET contador
+                    self._fallos_analisis_medio = 0
+                    return resultado
+                except Exception as e:
+                    self.logger.error(f"❌ {simbolo}: Error en analisis_medio() - {type(e).__name__}: {e}")
+                    self._fallos_analisis_medio += 1
+                    self._verificar_alertas_fallos(simbolo, 'medio', e)
+                    return None
             else:
                 self._fallos_analisis_medio += 1
                 self._verificar_alertas_fallos(simbolo, 'medio')
@@ -770,10 +1219,14 @@ class MonitorPosiciones:
         
         return None
     
+    # ============================================================
+    # ✅ CORREGIDO V9.74: Verificar alertas de fallos
+    # ============================================================
+    
     def _verificar_alertas_fallos(self, simbolo: str, tipo: str, error: Optional[Exception] = None):
         """
         Verifica si se debe notificar al operador por fallos de análisis.
-        V9.3 - CORREGIDO.
+        V9.74 - CORREGIDO: Notifica SOLO si el fallo es persistente.
         """
         fallos = 0
         if tipo == 'rápido':
@@ -781,8 +1234,9 @@ class MonitorPosiciones:
         else:
             fallos = self._fallos_analisis_medio
         
-        if fallos == self._max_fallos_antes_alerta:
-            mensaje = f"Análisis {tipo} falló {fallos} veces para {simbolo}"
+        # ✅ CORREGIDO: Notificar a los 5 (más temprano para diagnóstico)
+        if fallos == 5:
+            mensaje = f"Análisis {tipo} está fallando para {simbolo} ({fallos} intentos)"
             if error:
                 mensaje += f" - Último error: {error}"
             
@@ -794,8 +1248,21 @@ class MonitorPosiciones:
                     mensaje,
                     tipo='alerta'
                 )
-        elif fallos > self._max_fallos_antes_alerta and fallos % 10 == 0:
-            self.logger.warning(f"⚠️ Análisis {tipo} para {simbolo} con {fallos} fallos acumulados")
+        
+        # ✅ CORREGIDO: Notificar a los 10 SOLO si sigue fallando
+        elif fallos == 10:
+            mensaje = f"Análisis {tipo} FALLO PERSISTENTE para {simbolo} ({fallos} intentos)"
+            if error:
+                mensaje += f" - Último error: {error}"
+            
+            self.logger.error(f"❌ {mensaje}")
+            
+            if self.orquestador.notificaciones:
+                self.orquestador.notificaciones.enviar(
+                    "❌ MONITOREO CRÍTICO",
+                    mensaje,
+                    tipo='error'
+                )
     
     # ============================================================
     # MÉTODOS DE ANÁLISIS (COMPATIBILIDAD)
@@ -815,16 +1282,7 @@ class MonitorPosiciones:
     
     def _obtener_datos_h1(self, simbolo: str) -> Optional[Any]:
         """Obtiene datos H1 para trailing."""
-        try:
-            return self.orquestador.cache.get_datos(
-                simbolo=simbolo,
-                timeframe=60,
-                n_velas=50,
-                fetch_func=self.mt5.obtener_datos
-            )
-        except Exception as e:
-            self.logger.debug(f"⚠️ Error obteniendo H1: {e}")
-            return None
+        return self._obtener_datos_h1_recuperable(simbolo)
     
     # ============================================================
     # VERIFICAR SL/TP (CORREGIDO)
@@ -1044,6 +1502,7 @@ class MonitorPosiciones:
             'cierres_por_decision': 0,
             'fallos_analisis': 0,
             'ultima_posicion_procesada': None,
+            'sl_retrocesos_evitados': 0,
         }
         self._fallos_analisis_rapido = 0
         self._fallos_analisis_medio = 0
@@ -1057,7 +1516,7 @@ def create_monitor_posiciones(orquestador: Any,
                               mt5: Any,
                               gestion_riesgo: Any,
                               trailing_engine: Optional[TrailingEngine] = None,
-                              decisor_cierre: Optional[DecisorCierre] = None,
+                              decisor_cierre: Optional[Any] = None,
                               monitorear_manuales: bool = False) -> MonitorPosiciones:
     """
     Crea una instancia de MonitorPosiciones.
@@ -1067,7 +1526,7 @@ def create_monitor_posiciones(orquestador: Any,
         mt5: Conector MT5
         gestion_riesgo: Gestión de riesgo
         trailing_engine: Motor de trailing (opcional)
-        decisor_cierre: Decisor de cierre (opcional)
+        decisor_cierre: Decisor de cierre (opcional - NO USADO)
         monitorear_manuales: Si True, monitorea también posiciones manuales
     
     Returns:

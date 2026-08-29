@@ -104,9 +104,9 @@ class AnalisisRapidoEngine:
             ema21 = df['Close'].ewm(span=21, adjust=False).mean().iloc[-1]
             
             # Tendencia
-            if ema9 > ema21 * 1.001:
+            if ema9 > ema21 * 1.0001:
                 tendencia = 'ALCISTA'
-            elif ema9 < ema21 * 0.999:
+            elif ema9 < ema21 * 0.9999:
                 tendencia = 'BAJISTA'
             else:
                 tendencia = 'LATERAL'

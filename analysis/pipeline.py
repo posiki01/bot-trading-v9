@@ -370,6 +370,10 @@ class PipelineOportunidades:
         return self.LIMITES_INTENTOS_POR_CALIDAD.get(calidad, 5)
 
     def _degradar_oportunidad(self, simbolo: str, razon: str = ""):
+        """
+        Degrada una oportunidad a FASE_1 para re-análisis.
+        V9.2 - CORREGIDO: No intenta re-analizar (solo degradar).
+        """
         estado = self.estados.get(simbolo)
         if not estado:
             return
@@ -399,9 +403,8 @@ class PipelineOportunidades:
         # Guardar cambios
         self._guardar_estados_en_sqlite()
         
-        # ✅ RE-ANALIZAR INMEDIATAMENTE (opcional)
-        if hasattr(self, 'orquestador') and self.orquestador:
-            self.orquestador._precargar_simbolo(simbolo)  # Precarga H1 inmediata
+        # ✅ CORREGIDO: NO intentar re-analizar (depende del orquestador)
+        # Solo degradar, el orquestador se encargará de re-analizar
 
     def _degradar_oportunidad_por_tiempo(self, simbolo: str, max_horas: float = 4.0):
         """
@@ -452,83 +455,17 @@ class PipelineOportunidades:
                 razon=f"Demasiados intentos en {fase} ({intentos})"
             )
 
-    def _reanalizar_simbolo(self, simbolo: str):
-        """
-        Re-analiza un símbolo después de degradación.
-        
-        Args:
-            simbolo: Símbolo a re-analizar
-        """
-        # Obtener datos frescos
-        df_h1 = self.cache.get_datos(
-            simbolo=simbolo,
-            timeframe=60,
-            n_velas=250,
-            fetch_func=self.mt5.obtener_datos
-        )
-        
-        if df_h1 is None or len(df_h1) < 50:
-            self.logger.info(f"⏭️ {simbolo}: Datos insuficientes para re-análisis")
-            return
-        
-        # Ejecutar análisis rápido
-        rapido = self.analisis_capas.analisis_rapido(df_h1, simbolo)
-        if not rapido.pasa_filtro:
-            self.logger.info(f"⏭️ {simbolo}: Filtro rápido falló - {rapido.razon_rechazo}")
-            return
-        
-        # Detectar niveles
-        precio_actual = df_h1['Close'].iloc[-1]
-        niveles = self.nivel_tracker.detectar_y_actualizar_niveles(
-            simbolo=simbolo,
-            df=df_h1,
-            precio_actual=precio_actual
-        )
-        
-        # Análisis medio
-        medio = self.analisis_capas.analisis_medio(df_h1, simbolo, rapido, niveles)
-        if not medio.pasa_filtro:
-            self.logger.info(f"⏭️ {simbolo}: Filtro medio falló - {medio.razon_rechazo}")
-            return
-        
-        # Análisis pesado
-        pesado = self.analisis_capas.analisis_pesado(df_h1, simbolo, None, None, niveles, medio)
-        if not pesado:
-            self.logger.info(f"⏭️ {simbolo}: Análisis pesado falló")
-            return
-        
-        # Calcular score
-        score_h1 = self.score_engine.calcular_score_h1(
-            score_estructura=pesado.score_estructura,
-            score_momentum=pesado.score_momentum,
-            score_confluencia=pesado.score_confluencia,
-            score_institucional=pesado.score_institucional,
-            simbolo=simbolo
-        ).score
-        
-        # Determinar dirección
-        direccion = self._determinar_direccion_mejorado(medio, pesado, None, df_h1, 'UNCERTAIN')
-        
-        # Actualizar pipeline (FASE_1)
-        self.pipeline.actualizar_fase_1(
-            simbolo=simbolo,
-            analisis={'rapido': rapido, 'medio': medio, 'pesado': pesado},
-            score=score_h1,
-            direccion=direccion,
-            regimen='UNCERTAIN',
-            contexto_h1={
-                'score': score_h1,
-                'direccion': direccion,
-                'en_nivel_clave': medio.en_nivel_clave,
-                'niveles': {
-                    'soportes': niveles.get('soportes', []),
-                    'resistencias': niveles.get('resistencias', [])
-                }
-            },
-            analisis_pesado=pesado
-        )
-        
-        self.logger.info(f"✅ {simbolo}: Re-analizado - Score: {score_h1:.1f}, Dirección: {direccion}")
+        def _reanalizar_simbolo(self, simbolo: str):
+            """
+            Re-analiza un símbolo después de degradación.
+            V9.2 - CORREGIDO: Solo degrada, no intenta re-analizar.
+            
+            NOTA: Esta función se mantiene por compatibilidad, pero NO debe usarse.
+            El orquestador se encarga de re-analizar los símbolos degradados.
+            """
+            self.logger.info(f"⏭️ {simbolo}: Degradado, será re-analizado por el orquestador")
+            # No intentar acceder a self.cache o self.mt5
+            # Solo loggear, el orquestador se encargará de re-analizar
         
     def _guardar_estados_en_sqlite(self):
         """
@@ -636,139 +573,147 @@ class PipelineOportunidades:
         """
         Actualiza la oportunidad en Fase 1 (H1) - V9.30 REFACTORIZADO.
         PROMOCIÓN INMEDIATA a FASE_2 y FASE_3 según score.
+        
+        V9.2 - CORREGIDO: try/except para evitar que el pipeline falle.
         """
-        # ============================================================
-        # 1. VALIDAR SCORE MÍNIMO
-        # ============================================================
-        if score < self.umbral_fase_1 * 0.5:
-            self.logger.info(f"⏭️ {simbolo}: Score insuficiente ({score:.1f} < {self.umbral_fase_1 * 0.5:.1f})")
-            return None
-        
-        # ============================================================
-        # 2. BUSCAR O CREAR ESTADO
-        # ============================================================
-        estado = self.estados.get(simbolo)
-        
-        if estado is None:
-            # Crear nuevo estado - SIN condiciones pendientes
-            estado = EstadoOportunidad(
-                simbolo=simbolo,
-                fase_actual=FaseOportunidad.FASE_1,
-                direccion=direccion,
-                score_acumulado=score,
-                timestamp_creacion=datetime.now(timezone.utc),
-                timestamp_ultima_actualizacion=datetime.now(timezone.utc),
-                condiciones_pendientes=[],  # ✅ VACÍO
-                condiciones_cumplidas=[],   # ✅ VACÍO
-                analisis_h1=analisis,
-                analisis_pesado=analisis_pesado,
-                regimen=regimen,
-                direccion_regimen=direccion_regimen,
-                confianza_regimen=confianza_regimen,
-                tendencia_h4=tendencia_h4,
-                contexto_h1=contexto_h1 if contexto_h1 is not None else {},
-            )
-            self.estados[simbolo] = estado
-            self._stats['creadas'] += 1
-            self.logger.info(f"📝 {simbolo}: Nueva oportunidad creada en FASE_1 (score: {score:.1f})")
-        
-        else:
-            # Estado existente - actualizar
-            if estado.fase_actual.es_terminal():
-                return estado
+        try:
+            # ============================================================
+            # 1. VALIDAR SCORE MÍNIMO
+            # ============================================================
+            if score < self.umbral_fase_1 * 0.5:
+                self.logger.info(f"⏭️ {simbolo}: Score insuficiente ({score:.1f} < {self.umbral_fase_1 * 0.5:.1f})")
+                return None
             
-            # Actualizar datos
-            if contexto_h1 is not None and len(contexto_h1) > 0:
-                if estado.contexto_h1 is None:
-                    estado.contexto_h1 = {}
-                if 'niveles' not in contexto_h1 and 'niveles' in estado.contexto_h1:
-                    contexto_h1['niveles'] = estado.contexto_h1['niveles']
-                estado.contexto_h1.update(contexto_h1)
+            # ============================================================
+            # 2. BUSCAR O CREAR ESTADO
+            # ============================================================
+            estado = self.estados.get(simbolo)
             
-            estado.analisis_h1 = analisis
-            estado.analisis_pesado = analisis_pesado
-            estado.direccion = direccion
-            estado.regimen = regimen
-            estado.direccion_regimen = direccion_regimen
-            estado.confianza_regimen = confianza_regimen
-            estado.tendencia_h4 = tendencia_h4
-            estado.timestamp_ultima_actualizacion = datetime.now(timezone.utc)
+            if estado is None:
+                # Crear nuevo estado - SIN condiciones pendientes
+                estado = EstadoOportunidad(
+                    simbolo=simbolo,
+                    fase_actual=FaseOportunidad.FASE_1,
+                    direccion=direccion,
+                    score_acumulado=score,
+                    timestamp_creacion=datetime.now(timezone.utc),
+                    timestamp_ultima_actualizacion=datetime.now(timezone.utc),
+                    condiciones_pendientes=[],  # ✅ VACÍO
+                    condiciones_cumplidas=[],   # ✅ VACÍO
+                    analisis_h1=analisis,
+                    analisis_pesado=analisis_pesado,
+                    regimen=regimen,
+                    direccion_regimen=direccion_regimen,
+                    confianza_regimen=confianza_regimen,
+                    tendencia_h4=tendencia_h4,
+                    contexto_h1=contexto_h1 if contexto_h1 is not None else {},
+                )
+                self.estados[simbolo] = estado
+                self._stats['creadas'] += 1
+                self.logger.info(f"📝 {simbolo}: Nueva oportunidad creada en FASE_1 (score: {score:.1f})")
             
-            if score > estado.score_acumulado:
-                estado.score_acumulado = score
+            else:
+                # Estado existente - actualizar
+                if estado.fase_actual.es_terminal():
+                    return estado
+                
+                # Actualizar datos
+                if contexto_h1 is not None and len(contexto_h1) > 0:
+                    if estado.contexto_h1 is None:
+                        estado.contexto_h1 = {}
+                    if 'niveles' not in contexto_h1 and 'niveles' in estado.contexto_h1:
+                        contexto_h1['niveles'] = estado.contexto_h1['niveles']
+                    estado.contexto_h1.update(contexto_h1)
+                
+                estado.analisis_h1 = analisis
+                estado.analisis_pesado = analisis_pesado
+                estado.direccion = direccion
+                estado.regimen = regimen
+                estado.direccion_regimen = direccion_regimen
+                estado.confianza_regimen = confianza_regimen
+                estado.tendencia_h4 = tendencia_h4
+                estado.timestamp_ultima_actualizacion = datetime.now(timezone.utc)
+                
+                if score > estado.score_acumulado:
+                    estado.score_acumulado = score
+                
+                self.logger.info(f"🔄 {simbolo}: Actualizado en FASE_1 (score: {estado.score_acumulado:.1f})")
             
-            self.logger.info(f"🔄 {simbolo}: Actualizado en FASE_1 (score: {estado.score_acumulado:.1f})")
-        
-        # ============================================================
-        # 3. ✅ PROMOCIÓN INMEDIATA A FASE_2
-        # ============================================================
-        if estado.score_acumulado >= self.umbral_fase_2:
-            if estado.fase_actual == FaseOportunidad.FASE_1:
-                estado.fase_actual = FaseOportunidad.FASE_2
-                estado.agregar_condicion("Score_Fase2")
-                estado.agregar_condicion("M15_Confirmacion")
-                self._stats['promovidas_f1_f2'] += 1
-                self.logger.info(f"⬆️ {simbolo}: PROMOVIDO INMEDIATO a FASE_2 (score: {estado.score_acumulado:.1f} >= {self.umbral_fase_2})")
-            elif estado.fase_actual == FaseOportunidad.FASE_2:
-                # Ya está en FASE_2, mantener
-                pass
-        
-        # ============================================================
-        # 4. ✅ PROMOCIÓN INMEDIATA A FASE_3 (si score es muy alto)
-        # ============================================================
-        if estado.score_acumulado >= self.umbral_fase_3:
-            if estado.fase_actual == FaseOportunidad.FASE_2:
-                estado.fase_actual = FaseOportunidad.FASE_3
-                estado.agregar_condicion("Score_Fase3")
-                estado.agregar_condicion("M5_Sniper")
-                self._stats['promovidas_f2_f3'] += 1
-                self.logger.info(f"⬆️ {simbolo}: PROMOVIDO INMEDIATO a FASE_3 (score: {estado.score_acumulado:.1f} >= {self.umbral_fase_3})")
-            elif estado.fase_actual == FaseOportunidad.FASE_1:
-                # Si está en FASE_1 y el score es suficiente para FASE_3, promover directamente
-                # Pero primero pasar por FASE_2 (flujo normal)
-                if estado.score_acumulado >= self.umbral_fase_2:
+            # ============================================================
+            # 3. ✅ PROMOCIÓN INMEDIATA A FASE_2
+            # ============================================================
+            if estado.score_acumulado >= self.umbral_fase_2:
+                if estado.fase_actual == FaseOportunidad.FASE_1:
                     estado.fase_actual = FaseOportunidad.FASE_2
                     estado.agregar_condicion("Score_Fase2")
                     estado.agregar_condicion("M15_Confirmacion")
                     self._stats['promovidas_f1_f2'] += 1
-                    self.logger.info(f"⬆️ {simbolo}: PROMOVIDO a FASE_2 (score: {estado.score_acumulado:.1f})")
-                    
-                    # Y luego a FASE_3
-                    if estado.score_acumulado >= self.umbral_fase_3:
-                        estado.fase_actual = FaseOportunidad.FASE_3
-                        estado.agregar_condicion("Score_Fase3")
-                        estado.agregar_condicion("M5_Sniper")
-                        self._stats['promovidas_f2_f3'] += 1
-                        self.logger.info(f"⬆️ {simbolo}: PROMOVIDO INMEDIATO a FASE_3 (score: {estado.score_acumulado:.1f} >= {self.umbral_fase_3})")
-        
-        # ============================================================
-        # 5. ✅ GUARDAR NIVEL ESPERADO PARA ESPERA ACTIVA
-        # ============================================================
-        if estado.contexto_h1:
-            soporte_cercano = estado.contexto_h1.get('soporte_cercano')
-            resistencia_cercana = estado.contexto_h1.get('resistencia_cercana')
-            precio_actual = estado.contexto_h1.get('precio_actual', 0)
+                    self.logger.info(f"⬆️ {simbolo}: PROMOVIDO INMEDIATO a FASE_2 (score: {estado.score_acumulado:.1f} >= {self.umbral_fase_2})")
+                elif estado.fase_actual == FaseOportunidad.FASE_2:
+                    # Ya está en FASE_2, mantener
+                    pass
             
-            if soporte_cercano and soporte_cercano > 0 and precio_actual > 0:
-                distancia_soporte = (precio_actual - soporte_cercano) / precio_actual * 100
-                if distancia_soporte < 2.0:
-                    estado.contexto_h1['nivel_esperado'] = soporte_cercano
-                    estado.contexto_h1['modo_esperado'] = 'RETEST'
-                    estado.metadata['esperando_nivel'] = True
+            # ============================================================
+            # 4. ✅ PROMOCIÓN INMEDIATA A FASE_3 (si score es muy alto)
+            # ============================================================
+            if estado.score_acumulado >= self.umbral_fase_3:
+                if estado.fase_actual == FaseOportunidad.FASE_2:
+                    estado.fase_actual = FaseOportunidad.FASE_3
+                    estado.agregar_condicion("Score_Fase3")
+                    estado.agregar_condicion("M5_Sniper")
+                    self._stats['promovidas_f2_f3'] += 1
+                    self.logger.info(f"⬆️ {simbolo}: PROMOVIDO INMEDIATO a FASE_3 (score: {estado.score_acumulado:.1f} >= {self.umbral_fase_3})")
+                elif estado.fase_actual == FaseOportunidad.FASE_1:
+                    # Si está en FASE_1 y el score es suficiente para FASE_3, promover directamente
+                    # Pero primero pasar por FASE_2 (flujo normal)
+                    if estado.score_acumulado >= self.umbral_fase_2:
+                        estado.fase_actual = FaseOportunidad.FASE_2
+                        estado.agregar_condicion("Score_Fase2")
+                        estado.agregar_condicion("M15_Confirmacion")
+                        self._stats['promovidas_f1_f2'] += 1
+                        self.logger.info(f"⬆️ {simbolo}: PROMOVIDO a FASE_2 (score: {estado.score_acumulado:.1f})")
+                        
+                        # Y luego a FASE_3
+                        if estado.score_acumulado >= self.umbral_fase_3:
+                            estado.fase_actual = FaseOportunidad.FASE_3
+                            estado.agregar_condicion("Score_Fase3")
+                            estado.agregar_condicion("M5_Sniper")
+                            self._stats['promovidas_f2_f3'] += 1
+                            self.logger.info(f"⬆️ {simbolo}: PROMOVIDO INMEDIATO a FASE_3 (score: {estado.score_acumulado:.1f} >= {self.umbral_fase_3})")
             
-            if resistencia_cercana and resistencia_cercana > 0 and precio_actual > 0:
-                distancia_resistencia = (resistencia_cercana - precio_actual) / precio_actual * 100
-                if distancia_resistencia < 0.5:
-                    estado.contexto_h1['nivel_esperado'] = resistencia_cercana
-                    estado.contexto_h1['modo_esperado'] = 'PULLBACK'
-                    estado.metadata['esperando_nivel'] = True
-        
-        # ============================================================
-        # 6. ✅ GUARDAR EN SQLITE
-        # ============================================================
-        self._guardar_estados_en_sqlite()
-        
-        return estado
+            # ============================================================
+            # 5. ✅ GUARDAR NIVEL ESPERADO PARA ESPERA ACTIVA
+            # ============================================================
+            if estado.contexto_h1:
+                soporte_cercano = estado.contexto_h1.get('soporte_cercano')
+                resistencia_cercana = estado.contexto_h1.get('resistencia_cercana')
+                precio_actual = estado.contexto_h1.get('precio_actual', 0)
+                
+                if soporte_cercano and soporte_cercano > 0 and precio_actual > 0:
+                    distancia_soporte = (precio_actual - soporte_cercano) / precio_actual * 100
+                    if distancia_soporte < 2.0:
+                        estado.contexto_h1['nivel_esperado'] = soporte_cercano
+                        estado.contexto_h1['modo_esperado'] = 'RETEST'
+                        estado.metadata['esperando_nivel'] = True
+                
+                if resistencia_cercana and resistencia_cercana > 0 and precio_actual > 0:
+                    distancia_resistencia = (resistencia_cercana - precio_actual) / precio_actual * 100
+                    if distancia_resistencia < 0.5:
+                        estado.contexto_h1['nivel_esperado'] = resistencia_cercana
+                        estado.contexto_h1['modo_esperado'] = 'PULLBACK'
+                        estado.metadata['esperando_nivel'] = True
+            
+            # ============================================================
+            # 6. ✅ GUARDAR EN SQLITE
+            # ============================================================
+            self._guardar_estados_en_sqlite()
+            
+            return estado
+            
+        except Exception as e:
+            # ✅ CORREGIDO V9.2: Capturar cualquier excepción
+            self.logger.error(f"❌ Error en actualizar_fase_1({simbolo}): {e}", exc_info=True)
+            return None
 
         
     def actualizar_fase_2(self, simbolo: str, analisis_m15: Dict, score: float) -> Optional[EstadoOportunidad]:

@@ -240,22 +240,58 @@ class GestionRiesgo:
             self.logger.warning(f"⚠️ Error obteniendo capital de MT5: {e}")
         
         return float(self.capital_actual)
+
+    def _obtener_tamano_contrato(self, simbolo: str) -> float:
+        """
+        Obtiene el tamaño del contrato para cada símbolo.
+        V9.1 - NUEVO: Para calcular valor de pip en USD correctamente.
+        """
+        simbolo_upper = simbolo.upper()
+        
+        # FOREX: 100,000 unidades
+        if len(simbolo_upper) == 6:
+            return 100000.0
+        
+        # METALES
+        if 'XAU' in simbolo_upper:
+            return 100.0  # 1 lote = 100 onzas
+        if 'XAG' in simbolo_upper:
+            return 5000.0  # 1 lote = 5,000 onzas
+        
+        # ÍNDICES
+        if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500', 'SP500']):
+            return 1.0  # 1 lote = 1 contrato
+        
+        # CRIPTO
+        if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
+            return 1.0  # 1 lote = 1 unidad
+        
+        return 100000.0  # Default
     
     def obtener_margen_libre(self) -> float:
         """
         Obtiene margen libre REAL desde MT5.
-        V9.65 - CRÍTICO: Para validar si se puede abrir posiciones.
-        
-        Returns:
-            Margen libre en USD
+        V9.65 - CORREGIDO DEFINITIVO: Usa claves correctas.
         """
         if self.modo_backtest or self.mt5 is None:
             return float(self.capital_actual) * 0.8  # Estimación
         
         try:
             cuenta = self.mt5.info_cuenta()
-            if cuenta and cuenta.get('margin_free', 0) > 0:
-                return float(cuenta['margin_free'])
+            if cuenta:
+                # ✅ CORREGIDO: Usar 'margen_libre' (español)
+                margen_libre = float(cuenta.get('margen_libre', 0) or 0)
+                
+                # ✅ FALLBACK: Si 'margen_libre' no existe, usar 'margin_free'
+                if margen_libre <= 0:
+                    margen_libre = float(cuenta.get('margin_free', 0) or 0)
+                
+                # ✅ Si todavía es 0, usar equity como aproximación
+                if margen_libre <= 0:
+                    margen_libre = float(cuenta.get('equity', 0) or 0)
+                
+                self.logger.info(f"💰 Margen libre obtenido: ${margen_libre:.2f}")
+                return margen_libre
         except Exception as e:
             self.logger.warning(f"⚠️ Error obteniendo margen libre: {e}")
         
@@ -313,6 +349,7 @@ class GestionRiesgo:
         # 8. ✅ VERIFICAR MARGEN LIBRE
         margen_libre = self.obtener_margen_libre()
         if margen_libre < 50.0:
+            self.logger.info(f"⚠️ Margen libre bajo: ${margen_libre:.2f}")
             return False, f"Margen libre insuficiente (${margen_libre:.2f} < $50)"
         
         return True, "OK"
@@ -453,20 +490,27 @@ class GestionRiesgo:
 
     def _obtener_pip_size(self, simbolo: str) -> float:
         """Obtiene el tamaño del pip para el símbolo."""
-        simbolo_upper = simbolo.upper()
-        
-        if 'JPY' in simbolo_upper:
-            return 0.01
-        elif 'XAU' in simbolo_upper:
-            return 0.01
-        elif 'XAG' in simbolo_upper:
-            return 0.1
-        elif any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
-            return 1.0
-        elif any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
-            return 1.0
-        else:
-            return 0.0001
+        try:
+            from utils.parametros_simbolo import get_pip_val
+            return get_pip_val(simbolo, self.mt5 if hasattr(self, 'mt5') else None)
+        except ImportError:
+            simbolo_upper = simbolo.upper()
+            if 'JPY' in simbolo_upper:
+                return 0.01
+            elif 'XAU' in simbolo_upper:
+                return 0.10  # ✅ CORREGIDO: 0.10 para oro
+            elif 'XAG' in simbolo_upper:
+                return 0.01
+            elif any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
+                return 1.0
+            elif 'BTC' in simbolo_upper:
+                return 1.0
+            elif 'ETH' in simbolo_upper:
+                return 1.0
+            elif 'SOL' in simbolo_upper:
+                return 1.0
+            else:
+                return 0.0001
 
 
     def _calcular_valor_pip(self,

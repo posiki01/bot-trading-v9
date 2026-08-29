@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-utils/helpers.py (V9.1 - REFACTORIZADO)
+utils/helpers.py (V9.70 - CORREGIDO DEFINITIVO)
 Utilidades generales para el bot.
 """
 
@@ -319,7 +319,7 @@ def es_metal(simbolo: str) -> bool:
 
 def get_tipo_activo(simbolo: str) -> str:
     if es_crypto(simbolo):
-        return 'CRYPTO'  # ✅ CORREGIDO: Coincide con umbrales.py
+        return 'CRYPTO'
     elif es_indice(simbolo):
         return 'INDICES_US'
     elif es_metal(simbolo):
@@ -346,45 +346,55 @@ def get_base_quote(simbolo: str) -> Tuple[str, str]:
 
 
 # ============================================================
-# PIP VALUE Y DIGITS POR SÍMBOLO (NUEVO)
+# PIP VALUE Y DIGITS POR SÍMBOLO (CORREGIDO - SIN RECURSIÓN)
 # ============================================================
 
-def get_pip_val(simbolo: str, precio: float = 0.0) -> float:
+def get_pip_val(simbolo: str, precio: float = 0.0, mt5: Optional[Any] = None) -> float:
     """
     Obtiene el valor de un pip para el símbolo.
-    V9.1 - CORREGIDO: XAUUSD usa 0.01, XAGUSD usa 0.1
+    V9.70 - CORREGIDO DEFINITIVO - SIN RECURSIÓN.
     """
+    # ✅ CORREGIDO: NO importar desde parametros_simbolo (evita recursión)
     simbolo_upper = simbolo.upper()
     if 'JPY' in simbolo_upper:
         return 0.01
     if 'XAU' in simbolo_upper:
-        return 0.01  # ✅ CORREGIDO: Oro usa point = 0.01
+        return 0.10  # ✅ CORREGIDO: 0.10 para oro
     if 'XAG' in simbolo_upper:
-        return 0.1   # ✅ CORREGIDO: Plata usa point = 0.001, pip = 0.1
-    if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500', 'SP500']):
+        return 0.01
+    if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
         return 1.0
-    if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
+    if 'BTC' in simbolo_upper:
         return 1.0
-    return 0.0001
+    if 'ETH' in simbolo_upper:
+        return 1.0
+    if 'SOL' in simbolo_upper:
+        return 1.0
+    return 0.0001  # ✅ Forex estándar
 
 
-def get_digits(simbolo: str) -> int:
+def get_digits(simbolo: str, mt5: Optional[Any] = None) -> int:
     """
     Obtiene el número de dígitos del símbolo.
-    V9.1 - CORREGIDO: XAGUSD usa 3, índices usan 1
+    V9.70 - CORREGIDO DEFINITIVO - SIN RECURSIÓN.
     """
+    # ✅ CORREGIDO: NO importar desde parametros_simbolo (evita recursión)
     simbolo_upper = simbolo.upper()
     if 'JPY' in simbolo_upper:
         return 3
     if 'XAU' in simbolo_upper:
         return 2
     if 'XAG' in simbolo_upper:
-        return 3  # ✅ CORREGIDO: Plata usa 3 dígitos
+        return 3
     if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
-        return 1  # ✅ CORREGIDO: Índices usan 1 dígito
-    if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
+        return 1
+    if 'BTC' in simbolo_upper:
         return 2
-    return 5
+    if 'ETH' in simbolo_upper:
+        return 2
+    if 'SOL' in simbolo_upper:
+        return 2
+    return 5  # ✅ CORREGIDO: 5 para Forex estándar
 
 
 # ============================================================

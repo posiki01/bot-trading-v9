@@ -317,15 +317,13 @@ class AnalisisMedioEngine:
             except Exception as e:
                 self.logger.debug(f"Error obteniendo niveles del tracker: {e}")
 
-        # 2. Fallback: detectar niveles locales (CORREGIDO)
+        # 2. Fallback: detectar niveles locales (CORREGIDO PARA H1)
         if soporte is None or resistencia is None:
             try:
-                window = 5  # ✅ CORREGIDO: Ventana más pequeña
-                lookback = 30  # ✅ CORREGIDO: Más velas para buscar
+                window = 10  # ✅ AUMENTADO: Ventana más amplia para H1
+                lookback = 100  # ✅ AUMENTADO: Buscar más velas en H1
                 low = df['Low']
                 high = df['High']
-
-                self.logger.debug(f"📊 {simbolo}: Buscando niveles locales (window={window}, lookback={lookback})...")
 
                 # Buscar soportes (mínimos locales)
                 for i in range(len(df) - lookback, len(df) - 2):
@@ -336,8 +334,7 @@ class AnalisisMedioEngine:
                             if dist < DISTANCIA_MAXIMA_PCT:
                                 if soporte is None or dist < (precio_actual - soporte) / precio_actual * 100:
                                     soporte = precio_s
-                                    soporte_hits = 1
-                                    self.logger.debug(f"📊 {simbolo}: Soporte local: {precio_s:.5f} (dist: {dist:.2f}%)")
+                                    soporte_hits = self._contar_hits_soporte(df, precio_s, precio_actual)
 
                 # Buscar resistencias (máximos locales)
                 for i in range(len(df) - lookback, len(df) - 2):
@@ -348,8 +345,7 @@ class AnalisisMedioEngine:
                             if dist < DISTANCIA_MAXIMA_PCT:
                                 if resistencia is None or dist < (resistencia - precio_actual) / precio_actual * 100:
                                     resistencia = precio_r
-                                    resistencia_hits = 1
-                                    self.logger.debug(f"📊 {simbolo}: Resistencia local: {precio_r:.5f} (dist: {dist:.2f}%)")
+                                    resistencia_hits = self._contar_hits_resistencia(df, precio_r, precio_actual)
             except Exception as e:
                 self.logger.debug(f"Error en detección local de niveles: {e}")
 
@@ -656,3 +652,23 @@ class AnalisisMedioEngine:
         self.logger.info(f"   🔧 SUGERENCIA: Ajustar adx_fuerte ({adx_umbral}) o distancia_nivel_max (3.0%)")
 
         return razon
+    
+    def _contar_hits_soporte(self, df: pd.DataFrame, precio: float, precio_actual: float) -> int:
+        """Cuenta hits de soporte en el DataFrame."""
+        hits = 0
+        lookback = 100
+        for i in range(max(0, len(df) - lookback), len(df) - 1):
+            if df['Low'].iloc[i] <= precio * 1.001 and df['Low'].iloc[i] >= precio * 0.999:
+                if df['Close'].iloc[i] > precio:
+                    hits += 1
+        return max(1, hits)
+
+    def _contar_hits_resistencia(self, df: pd.DataFrame, precio: float, precio_actual: float) -> int:
+        """Cuenta hits de resistencia en el DataFrame."""
+        hits = 0
+        lookback = 100
+        for i in range(max(0, len(df) - lookback), len(df) - 1):
+            if df['High'].iloc[i] >= precio * 0.999 and df['High'].iloc[i] <= precio * 1.001:
+                if df['Close'].iloc[i] < precio:
+                    hits += 1
+        return max(1, hits)
