@@ -26,7 +26,7 @@ class EntornoDesarrollo:
     MAX_SIMULTANEAS = 2
     
     # Lotes
-    MAX_LOTE_ABSOLUTO = 0.02
+    MAX_LOTE_ABSOLUTO = 0.20
     MIN_LOTE_ABSOLUTO = 0.01
     
     # Logs
@@ -62,7 +62,7 @@ class EntornoProduccion:
     MAX_SIMULTANEAS = 4
     
     # Lotes
-    MAX_LOTE_ABSOLUTO = 0.05
+    MAX_LOTE_ABSOLUTO = 0.20
     MIN_LOTE_ABSOLUTO = 0.01
     
     # Logs
@@ -98,7 +98,7 @@ class EntornoBacktest:
     MAX_SIMULTANEAS = 5
     
     # Lotes
-    MAX_LOTE_ABSOLUTO = 0.03
+    MAX_LOTE_ABSOLUTO = 0.20
     MIN_LOTE_ABSOLUTO = 0.01
     
     # Logs

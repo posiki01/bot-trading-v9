@@ -221,6 +221,9 @@ class TrailingEngine:
         self.modo_backtest = modo_backtest
         self.modo_depuracion = modo_depuracion
         self.logger = logging.getLogger('BotTrading.Trailing')
+
+        # ✅ CORRECCIÓN: Copiar configuraciones como atributo de instancia
+        self.CONFIG_POR_MODO = {k: v.copy() for k, v in self.CONFIG_POR_MODO.items()}
         
         # Cargar configuración desde umbrales
         self._cargar_configuracion()
@@ -277,6 +280,7 @@ class TrailingEngine:
                                modo: str = 'RETEST') -> DecisionTrailing:
         """
         Calcula si se debe mover el SL y a dónde.
+        V9.2 - CORREGIDO: Normaliza dirección y usa precio actualizado.
         
         Args:
             pos: Datos de la posición
@@ -290,8 +294,8 @@ class TrailingEngine:
             DecisionTrailing
         """
         simbolo = pos.get('simbolo', '')
-        direccion = pos.get('direccion', 'COMPRA')
-        entry_price = pos.get('entrada', 0)
+        direccion = self._normalizar_direccion(pos.get('direccion', pos.get('tipo', 'COMPRA')))
+        entry_price = pos.get('entrada', pos.get('precio_apertura', 0))
         sl_actual = pos.get('sl', 0)
         
         # Validar datos
@@ -378,36 +382,32 @@ class TrailingEngine:
         return decision
     
     # ============================================================
+    # ✅ CORRECCIÓN V9.2: Normalizar dirección
+    # ============================================================
+    
+    def _normalizar_direccion(self, direccion: str) -> str:
+        """
+        Normaliza la dirección a formato interno.
+        V9.2 - CORREGIDO: Acepta BUY/SELL y COMPRA/VENTA.
+        """
+        if direccion is None:
+            return 'COMPRA'
+        
+        direccion = direccion.upper().strip()
+        
+        if direccion in ['BUY', 'LONG', 'COMPRA', 'B']:
+            return 'COMPRA'
+        if direccion in ['SELL', 'SHORT', 'VENTA', 'S']:
+            return 'VENTA'
+        
+        return 'COMPRA'
+    
+    # ============================================================
     # DECISIÓN DE TRAILING
     # ============================================================
     
-    def _decidir_trailing(self,
-                          ganancia_pips: float,
-                          precio_actual: float,
-                          entry_price: float,
-                          sl_actual: float,
-                          direccion: str,
-                          cfg: Dict[str, Any],
-                          pip_val: float,
-                          digits: int,
-                          analisis: AnalisisMercado) -> DecisionTrailing:
-        """
-        Decide si mover el SL y a dónde.
-        
-        Args:
-            ganancia_pips: Ganancia en pips
-            precio_actual: Precio actual
-            entry_price: Precio de entrada
-            sl_actual: SL actual
-            direccion: Dirección
-            cfg: Configuración del modo
-            pip_val: Valor del pip
-            digits: Dígitos del símbolo
-            analisis: Resultado del reanálisis
-        
-        Returns:
-            DecisionTrailing
-        """
+    def _decidir_trailing(self, ganancia_pips, precio_actual, entry_price, sl_actual, direccion, cfg, pip_val, digits, analisis):
+        """Decide si mover el SL y a dónde."""
         # FASE 0: GANANCIA INSUFICIENTE
         if ganancia_pips < cfg.get('min_pips_para_mover', 15):
             return DecisionTrailing(
@@ -415,9 +415,12 @@ class TrailingEngine:
                 fase="ESPERA"
             )
         
+        # ✅ CORRECCIÓN: Evaluar la MEJOR fase aplicable
+        mejor_decision = None
+        mejor_distancia = float('inf')
+        
         # FASE 1: BREAKEVEN
         if ganancia_pips >= cfg['breakeven_umbral']:
-            # Calcular breakeven
             if direccion == 'COMPRA':
                 nuevo_sl = entry_price + (cfg['breakeven_margen'] * pip_val)
             else:
@@ -434,7 +437,12 @@ class TrailingEngine:
                 nuevo_sl = entry_price - (2 * pip_val)
                 razon = f"BREAKEVEN_URGENTE (soporte a {analisis.dist_soporte:.2f}%)"
             
-            return self._crear_decision_sl(nuevo_sl, sl_actual, direccion, razon, fase)
+            decision_tmp = self._crear_decision_sl(nuevo_sl, sl_actual, direccion, razon, fase)
+            if decision_tmp.mover_sl:
+                distancia = abs(precio_actual - nuevo_sl)
+                if distancia < mejor_distancia:
+                    mejor_decision = decision_tmp
+                    mejor_distancia = distancia
         
         # FASE 2: TRAILING SUAVE
         if ganancia_pips >= cfg['trailing_umbral']:
@@ -446,7 +454,12 @@ class TrailingEngine:
             razon = f"TRAILING_SUAVE (distancia {cfg['trailing_distancia']}pips)"
             fase = "TRAILING_SUAVE"
             
-            return self._crear_decision_sl(nuevo_sl, sl_actual, direccion, razon, fase)
+            decision_tmp = self._crear_decision_sl(nuevo_sl, sl_actual, direccion, razon, fase)
+            if decision_tmp.mover_sl:
+                distancia = abs(precio_actual - nuevo_sl)
+                if distancia < mejor_distancia:
+                    mejor_decision = decision_tmp
+                    mejor_distancia = distancia
         
         # FASE 3: TRAILING AGRESIVO
         if ganancia_pips >= cfg['trailing_agresivo_umbral']:
@@ -458,29 +471,20 @@ class TrailingEngine:
             razon = f"TRAILING_AGRESSIVO (distancia {cfg['trailing_agresivo_distancia']}pips)"
             fase = "TRAILING_AGRESSIVO"
             
-            return self._crear_decision_sl(nuevo_sl, sl_actual, direccion, razon, fase)
+            decision_tmp = self._crear_decision_sl(nuevo_sl, sl_actual, direccion, razon, fase)
+            if decision_tmp.mover_sl:
+                distancia = abs(precio_actual - nuevo_sl)
+                if distancia < mejor_distancia:
+                    mejor_decision = decision_tmp
+                    mejor_distancia = distancia
+        
+        if mejor_decision is not None:
+            return mejor_decision
         
         return DecisionTrailing(razon="Sin cambio de SL", fase="NINGUNA")
     
-    def _crear_decision_sl(self,
-                           nuevo_sl: float,
-                           sl_actual: float,
-                           direccion: str,
-                           razon: str,
-                           fase: str) -> DecisionTrailing:
-        """
-        Crea una decisión de SL.
-        
-        Args:
-            nuevo_sl: Nuevo SL propuesto
-            sl_actual: SL actual
-            direccion: Dirección
-            razon: Razón del movimiento
-            fase: Fase del trailing
-        
-        Returns:
-            DecisionTrailing
-        """
+    def _crear_decision_sl(self, nuevo_sl, sl_actual, direccion, razon, fase):
+        """Crea una decisión de SL."""
         # Validar que mejora el SL actual
         if direccion == 'COMPRA' and nuevo_sl <= sl_actual:
             return DecisionTrailing(
@@ -627,11 +631,7 @@ class TrailingEngine:
     # TIMEOUT
     # ============================================================
     
-    def verificar_timeout(self,
-                          pos: Dict[str, Any],
-                          fecha: datetime,
-                          ganancia_pips: float,
-                          modo: str = 'RETEST') -> Tuple[bool, str]:
+    def verificar_timeout(self, pos, fecha, ganancia_pips, modo='RETEST'):
         """
         Verifica si la operación debe cerrarse por TIMEOUT.
         
@@ -644,13 +644,14 @@ class TrailingEngine:
         Returns:
             (debe_cerrar, razon)
         """
+        # ✅ CORREGIDO: Usar fecha_entrada de la posición (ya está en la posición)
         tiempo_abierto = (fecha - pos.get('fecha_entrada', fecha)).total_seconds() / 60
         
         cfg = self.CONFIG_POR_MODO.get(modo, self.CONFIG_POR_MODO['RETEST'])
         timeout_minutos = cfg.get('timeout_minutos', 480)
         
-        if self.modo_backtest:
-            timeout_minutos = int(timeout_minutos * 0.5)
+        # ✅ CORRECCIÓN: El timeout ya fue ajustado en _cargar_configuracion para modo_backtest
+        # No reducir de nuevo aquí.
         
         if tiempo_abierto > timeout_minutos:
             if ganancia_pips > 15:
@@ -703,50 +704,49 @@ class TrailingEngine:
     # UTILIDADES
     # ============================================================
     
-    def _obtener_pip_val(self, simbolo: str, precio: float) -> float:
-        """
-        Obtiene el valor de un pip para el símbolo.
-        
-        Args:
-            simbolo: Símbolo
-            precio: Precio de referencia
-        
-        Returns:
-            Valor del pip
-        """
-        simbolo_upper = simbolo.upper()
-        
-        if 'JPY' in simbolo_upper:
-            return 0.01
-        if any(x in simbolo_upper for x in ['XAU', 'XAG']):
-            return 0.10
-        if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
-            return 1.0
-        if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
-            return 1.0
-        return 0.0001
-    
     def _obtener_digits(self, simbolo: str) -> int:
-        """
-        Obtiene el número de dígitos del símbolo.
-        
-        Args:
-            simbolo: Símbolo
-        
-        Returns:
-            Número de dígitos
-        """
-        simbolo_upper = simbolo.upper()
-        
-        if 'JPY' in simbolo_upper:
-            return 3
-        if any(x in simbolo_upper for x in ['XAU', 'XAG']):
-            return 2
-        if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
-            return 2
-        if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
-            return 2
-        return 5
+        try:
+            from utils.parametros_simbolo import get_digits
+            return get_digits(simbolo, self.mt5 if hasattr(self, 'mt5') else None)
+        except ImportError:
+            simbolo_upper = simbolo.upper()
+            if 'JPY' in simbolo_upper:
+                return 3
+            if 'XAU' in simbolo_upper:
+                return 2
+            if 'XAG' in simbolo_upper:
+                return 3
+            if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
+                return 1
+            if 'BTC' in simbolo_upper:
+                return 2
+            if 'ETH' in simbolo_upper:
+                return 2
+            if 'SOL' in simbolo_upper:
+                return 2
+            return 5
+
+    def _obtener_pip_val(self, simbolo: str, precio: float) -> float:
+        try:
+            from utils.parametros_simbolo import get_pip_val
+            return get_pip_val(simbolo, self.mt5 if hasattr(self, 'mt5') else None)
+        except ImportError:
+            simbolo_upper = simbolo.upper()
+            if 'JPY' in simbolo_upper:
+                return 0.01
+            if 'XAU' in simbolo_upper:
+                return 0.01
+            if 'XAG' in simbolo_upper:
+                return 0.01
+            if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
+                return 1.0
+            if 'BTC' in simbolo_upper:
+                return 1.0
+            if 'ETH' in simbolo_upper:
+                return 0.01
+            if 'SOL' in simbolo_upper:
+                return 0.01
+            return 0.0001
     
     # ============================================================
     # LOGGING

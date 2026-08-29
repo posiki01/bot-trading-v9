@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
-"""
-analysis/ml/__init__.py (V9.0)
-Módulo de Machine Learning.
-"""
+"""Módulo de Machine Learning para el bot."""
 
-# Importar desde ml_optimizer.py
+# ============================================================
+# ORQUESTADOR PRINCIPAL
+# ============================================================
+
 from .ml_optimizer import MLOptimizer, create_ml_optimizer
 
-# También importar los submódulos si existen
-try:
-    from .ml_entrenamiento import EntrenadorML
-except ImportError:
-    EntrenadorML = None
+# ============================================================
+# SUBMÓDULOS (IMPORT CORRECTO)
+# ============================================================
 
-try:
-    from .ml_surrogate import SurrogateTrader
-except ImportError:
-    SurrogateTrader = None
+from .ml_entrenamiento import EntrenadorML
+from .ml_surrogate import SurrogateTrader
+from .ml_mining import HardNegativeMiner
+from .ml_drift import DriftDetector
+from .ml_persistencia import MLCache
+from .ml_prediccion import PredictorML
 
-try:
-    from .ml_mining import HardNegativeMiner
-except ImportError:
-    HardNegativeMiner = None
+# ============================================================
+# EXPORTAR TODO
+# ============================================================
 
 __all__ = [
     'MLOptimizer',
@@ -29,4 +28,7 @@ __all__ = [
     'EntrenadorML',
     'SurrogateTrader',
     'HardNegativeMiner',
+    'DriftDetector',
+    'MLCache',
+    'PredictorML',
 ]

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-trading/operabilidad.py (V9.0 - CORREGIDO)
+trading/operabilidad.py (V9.1 - CORREGIDO)
 Sistema de decisión de operabilidad para el Bot de Trading.
 
 RESPONSABILIDAD:
@@ -8,10 +8,9 @@ RESPONSABILIDAD:
 - Basado en score, régimen, horario y condiciones de mercado
 - NO contiene lógica de ejecución o trading
 
-CORRECCIONES V9.0:
-- Importación correcta de HorarioMercado
-- Eliminación de dependencia circular
-- Manejo de None en horario
+CORRECCIONES V9.1:
+- Eliminada dependencia circular con HorarioMercado
+- Inyección de dependencias mejorada
 """
 
 from enum import Enum
@@ -56,7 +55,7 @@ class DecisionOperabilidad:
 class DecisorOperabilidad:
     """
     Decide si un símbolo es operable en este momento.
-    V9.0 - CORREGIDO.
+    V9.1 - CORREGIDO.
     """
     
     # ============================================================
@@ -107,38 +106,43 @@ class DecisorOperabilidad:
     
     def __init__(self, 
                  config: Optional[Any] = None,
-                 horario: Optional[Any] = None,  # ← Usar Any para evitar importación circular
+                 horario: Optional[Any] = None,
                  modo_backtest: bool = False):
         """
         Inicializa el decisor de operabilidad.
         
         Args:
             config: Configuración (opcional)
-            horario: Gestor de horarios (opcional) - puede ser None
+            horario: Gestor de horarios (opcional)
             modo_backtest: Modo backtest
         """
         self.config = config
-        self.horario = horario  # Puede ser None
         self.modo_backtest = modo_backtest
         self.logger = logging.getLogger('BotTrading.Operabilidad')
         
-        # Si no hay horario, intentar crearlo
-        if self.horario is None:
+        # Inyección de dependencia: si no se proporciona horario, se crea internamente
+        if horario is None:
             self.horario = self._crear_horario()
+        else:
+            self.horario = horario
         
         # Cargar umbrales personalizados
         self._cargar_umbrales()
         
-        self.logger.info(f"🎯 DecisorOperabilidad V9.0 inicializado")
+        self.logger.info(f"🎯 DecisorOperabilidad V9.1 inicializado")
         self.logger.info(f"   Backtest: {modo_backtest}")
         self.logger.info(f"   Horario: {'✅' if self.horario else '❌'}")
     
     def _crear_horario(self):
         """Crea una instancia de HorarioMercado si es posible."""
         try:
-            # Intentar importar HorarioMercado
             from utils.tiempo import HorarioMercado
-            return HorarioMercado(zona_usuario='COLOMBIA')
+            from config.settings import Config
+            return HorarioMercado(
+                zona_usuario='COLOMBIA',
+                config_activos=Config.CONFIG_ACTIVOS,
+                modo_backtest=self.modo_backtest
+            )
         except ImportError as e:
             self.logger.warning(f"⚠️ No se pudo importar HorarioMercado: {e}")
             return None
@@ -178,26 +182,6 @@ class DecisorOperabilidad:
         """
         Decide si un símbolo es operable.
         
-        Args:
-            simbolo: Símbolo
-            score_final: Score final (0-100)
-            regimen: Régimen de mercado
-            hora_utc: Hora UTC en formato float
-            score_h1: Score H1
-            score_m15: Score M15
-            score_m5: Score M5
-            metrica_calidad: Métricas adicionales
-            es_reversal: Si es reversal
-            en_nivel_clave: Si está en nivel clave
-            volumen_relativo: Volumen relativo
-            adx_h1: ADX H1
-            patron_calidad: Calidad del patrón
-            ob_cercano: Order Block cercano
-            divergencia_rsi: Divergencia RSI
-            wyckoff_confianza: Confianza Wyckoff
-            modo: Modo de entrada
-            capital: Capital actual
-        
         Returns:
             DecisionOperabilidad
         """
@@ -214,9 +198,6 @@ class DecisorOperabilidad:
                 return self._crear_decision_no_operable(
                     score_final, f"Horario: {razon}"
                 )
-        else:
-            # Si no hay horario, continuar con advertencia
-            self.logger.debug(f"⚠️ Horario no disponible para {simbolo}, omitiendo validación")
         
         # 3. Seleccionar umbrales
         umbrales = self._obtener_umbrales(regimen, modo)

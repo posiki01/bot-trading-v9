@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-analysis/niveles_deteccion.py (V9.0)
+analysis/niveles_deteccion.py (V9.1 - CORREGIDO)
 Detección de niveles de soporte/resistencia.
 RESPONSABILIDAD: Solo detectar niveles, no persistir.
 """
@@ -17,56 +17,58 @@ logger = logging.getLogger('BotTrading.NivelesDeteccion')
 class DetectorNiveles:
     """
     Detecta niveles de soporte/resistencia en datos de mercado.
-    V9.0 - INDEPENDIENTE.
+    V9.1 - CORREGIDO: Inicialización de hits y paso de detección mejorados.
     """
     
     # Configuración por timeframe
     CONFIG_POR_TIMEFRAME = {
         'H1': {
             'ventana': 10,
-            'lookback': 100,
+            'lookback': 500,  # Aumentado para cubrir más historia
             'distancia_agrupacion': 0.002,
             'hits_minimos': 2,
             'max_niveles': 15,
         },
         'H4': {
             'ventana': 15,
-            'lookback': 50,
+            'lookback': 300,
             'distancia_agrupacion': 0.003,
             'hits_minimos': 2,
             'max_niveles': 10,
         },
         'D1': {
             'ventana': 20,
-            'lookback': 30,
+            'lookback': 200,
             'distancia_agrupacion': 0.005,
             'hits_minimos': 2,
             'max_niveles': 8,
         },
         'M15': {
             'ventana': 8,
-            'lookback': 30,
+            'lookback': 200,
             'distancia_agrupacion': 0.001,
             'hits_minimos': 1,
             'max_niveles': 5,
         },
         'M5': {
             'ventana': 6,
-            'lookback': 20,
+            'lookback': 150,
             'distancia_agrupacion': 0.001,
             'hits_minimos': 1,
             'max_niveles': 3,
         },
     }
     
-    def __init__(self, config: Optional[Any] = None):
+    def __init__(self, config: Optional[Any] = None, modo_inicial: bool = False):
         """
         Inicializa el detector de niveles.
         
         Args:
             config: Configuración (opcional)
+            modo_inicial: Modo inicial más permisivo
         """
         self.config = config
+        self.modo_inicial = modo_inicial
         self.logger = logging.getLogger('BotTrading.NivelesDeteccion')
         
         # Cargar configuración personalizada
@@ -86,10 +88,7 @@ class DetectorNiveles:
     # MÉTODOS PRINCIPALES DE DETECCIÓN
     # ============================================================
     
-    def detectar_niveles(self, 
-                         df: pd.DataFrame, 
-                         simbolo: str,
-                         timeframe: str = 'H1') -> Dict[str, List[Dict]]:
+    def detectar_niveles(self, df: pd.DataFrame, simbolo: str, timeframe: str = 'H1') -> Dict[str, List[Dict]]:
         """
         Detecta niveles en un DataFrame.
         
@@ -105,7 +104,13 @@ class DetectorNiveles:
             return {'soportes': [], 'resistencias': []}
         
         # Obtener configuración para este timeframe
-        config = self.CONFIG_POR_TIMEFRAME.get(timeframe, self.CONFIG_POR_TIMEFRAME['H1'])
+        config = self.CONFIG_POR_TIMEFRAME.get(timeframe, self.CONFIG_POR_TIMEFRAME['H1']).copy()
+        
+        # ✅ SI ESTAMOS EN MODO INICIAL, REDUCIR REQUISITOS
+        if self.modo_inicial:
+            config['hits_minimos'] = 1
+            config['fuerza_minima'] = 10
+            config['distancia_agrupacion'] = 0.005
         
         try:
             high = df['High']
@@ -113,7 +118,7 @@ class DetectorNiveles:
             close = df['Close']
             precio_actual = close.iloc[-1]
             
-            # Detectar niveles
+            # Detectar niveles (CON PASO 1 PARA NO PERDER NINGUNO)
             soportes = self._detectar_soportes(df, config)
             resistencias = self._detectar_resistencias(df, config)
             
@@ -153,26 +158,21 @@ class DetectorNiveles:
             return {'soportes': [], 'resistencias': []}
     
     # ============================================================
-    # DETECCIÓN DE SOPORTES
+    # DETECCIÓN DE SOPORTES (CORREGIDO)
     # ============================================================
     
     def _detectar_soportes(self, df: pd.DataFrame, config: Dict) -> List[Dict]:
         """
         Detecta niveles de soporte (mínimos locales).
-        
-        Args:
-            df: DataFrame
-            config: Configuración
-        
-        Returns:
-            Lista de soportes detectados
+        CORREGIDO: Paso 1, hits iniciales 1.
         """
         soportes = []
         low = df['Low']
         ventana = config['ventana']
         distancia_agrupacion = config['distancia_agrupacion']
         
-        for i in range(ventana, len(df) - ventana, 2):
+        # CORREGIDO: step=1 para no perder niveles
+        for i in range(ventana, len(df) - ventana, 1):
             if low.iloc[i] == low.iloc[i-ventana:i+ventana].min():
                 precio = low.iloc[i]
                 
@@ -180,7 +180,7 @@ class DetectorNiveles:
                 if not self._nivel_existe(soportes, precio, distancia_agrupacion):
                     soportes.append({
                         'precio': precio,
-                        'hits': 0,
+                        'hits': 1,  # CORREGIDO: inicializar con 1
                         'fuerza': 10,
                         'idx': i,
                         'tipo': 'soporte'
@@ -191,27 +191,22 @@ class DetectorNiveles:
     def _detectar_resistencias(self, df: pd.DataFrame, config: Dict) -> List[Dict]:
         """
         Detecta niveles de resistencia (máximos locales).
-        
-        Args:
-            df: DataFrame
-            config: Configuración
-        
-        Returns:
-            Lista de resistencias detectadas
+        CORREGIDO: Paso 1, hits iniciales 1.
         """
         resistencias = []
         high = df['High']
         ventana = config['ventana']
         distancia_agrupacion = config['distancia_agrupacion']
         
-        for i in range(ventana, len(df) - ventana, 2):
+        # CORREGIDO: step=1 para no perder niveles
+        for i in range(ventana, len(df) - ventana, 1):
             if high.iloc[i] == high.iloc[i-ventana:i+ventana].max():
                 precio = high.iloc[i]
                 
                 if not self._nivel_existe(resistencias, precio, distancia_agrupacion):
                     resistencias.append({
                         'precio': precio,
-                        'hits': 0,
+                        'hits': 1,  # CORREGIDO: inicializar con 1
                         'fuerza': 10,
                         'idx': i,
                         'tipo': 'resistencia'
@@ -220,7 +215,7 @@ class DetectorNiveles:
         return resistencias
     
     # ============================================================
-    # CONTEO DE HITS
+    # CONTEO DE HITS (CORREGIDO)
     # ============================================================
     
     def _contar_hits(self, 
@@ -230,25 +225,17 @@ class DetectorNiveles:
                      config: Dict) -> List[Dict]:
         """
         Cuenta cuántas veces se ha probado un nivel.
-        
-        Args:
-            df: DataFrame
-            niveles: Lista de niveles
-            tipo: 'soporte' o 'resistencia'
-            config: Configuración
-        
-        Returns:
-            Niveles con hits contados
+        CORREGIDO: Lookback más amplio.
         """
-        lookback = config['lookback']
+        lookback = config['lookback']  # Ahora 500 en H1
         tolerancia = config['distancia_agrupacion']
         precio_actual = df['Close'].iloc[-1]
         
         for nivel in niveles:
             precio = nivel['precio']
-            hits = 0
+            hits = nivel.get('hits', 1)  # Mantener el hit inicial
             
-            # Contar hits en la ventana
+            # Contar hits en la ventana (desde el inicio del lookback hasta el final)
             for j in range(max(0, len(df) - lookback), len(df) - 1):
                 if tipo == 'soporte':
                     if self._es_hit_soporte(df, j, precio, tolerancia):
@@ -294,15 +281,6 @@ class DetectorNiveles:
                          config: Dict) -> List[Dict]:
         """
         Calcula la fuerza de cada nivel (0-100).
-        
-        Args:
-            df: DataFrame
-            niveles: Lista de niveles
-            tipo: 'soporte' o 'resistencia'
-            config: Configuración
-        
-        Returns:
-            Niveles con fuerza calculada
         """
         for nivel in niveles:
             hits = nivel.get('hits', 0)
@@ -350,14 +328,6 @@ class DetectorNiveles:
     def _calcular_antiguedad(self, df: pd.DataFrame, precio: float, tipo: str) -> int:
         """
         Calcula la antigüedad de un nivel (0-100).
-        
-        Args:
-            df: DataFrame
-            precio: Precio del nivel
-            tipo: 'soporte' o 'resistencia'
-        
-        Returns:
-            Antigüedad (0-100)
         """
         try:
             if tipo == 'soporte':
@@ -379,14 +349,6 @@ class DetectorNiveles:
     def _calcular_volumen_en_nivel(self, df: pd.DataFrame, precio: float, tipo: str) -> int:
         """
         Calcula la fuerza por volumen en un nivel.
-        
-        Args:
-            df: DataFrame
-            precio: Precio del nivel
-            tipo: 'soporte' o 'resistencia'
-        
-        Returns:
-            Fuerza por volumen (0-20)
         """
         try:
             if 'Volume' not in df.columns:
@@ -435,15 +397,6 @@ class DetectorNiveles:
                                 max_distancia: float = 3.0) -> Optional[Dict]:
         """
         Encuentra el nivel más cercano al precio actual.
-        
-        Args:
-            niveles: Lista de niveles
-            precio_actual: Precio actual
-            tipo: 'soporte' o 'resistencia' (None = ambos)
-            max_distancia: Distancia máxima en porcentaje
-        
-        Returns:
-            Nivel más cercano o None
         """
         mejor_nivel = None
         mejor_distancia = float('inf')
@@ -453,11 +406,9 @@ class DetectorNiveles:
             if precio <= 0:
                 continue
             
-            # Filtrar por tipo
             if tipo and nivel.get('tipo') != tipo:
                 continue
             
-            # Calcular distancia
             if nivel.get('tipo') == 'soporte' and precio < precio_actual:
                 distancia = (precio_actual - precio) / precio_actual * 100
             elif nivel.get('tipo') == 'resistencia' and precio > precio_actual:
@@ -476,13 +427,6 @@ class DetectorNiveles:
                                   distancia: float) -> List[Dict]:
         """
         Agrupa niveles cercanos en uno solo.
-        
-        Args:
-            niveles: Lista de niveles
-            distancia: Distancia máxima para agrupar
-        
-        Returns:
-            Lista de niveles agrupados
         """
         if not niveles:
             return []
@@ -496,7 +440,6 @@ class DetectorNiveles:
             
             for grupo in agrupados:
                 if abs(grupo['precio'] - precio) / max(precio, 0.0001) < distancia:
-                    # Fusionar
                     grupo['hits'] = grupo.get('hits', 0) + nivel.get('hits', 0)
                     grupo['fuerza'] = max(grupo.get('fuerza', 0), nivel.get('fuerza', 0))
                     grupo['veces_tocado'] = grupo.get('veces_tocado', 0) + 1

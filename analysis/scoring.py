@@ -221,13 +221,13 @@ class ScoreEngine:
         start_time = time.time()
         
         # 1. Validar rangos
-        score_estructura = self._validar_score(score_estructura, 0, 30)
+        score_estructura = self._validar_score(score_estructura, 0, 35)
         score_momentum = self._validar_score(score_momentum, 0, 35)
         score_confluencia = self._validar_score(score_confluencia, 0, 35)
         score_institucional = self._validar_score(score_institucional, 0, 35)
         
         # 2. Normalizar a 0-100
-        norm_estructura = (score_estructura / 30.0) * 100.0
+        norm_estructura = (score_estructura / 35.0) * 100.0
         norm_momentum = (score_momentum / 35.0) * 100.0
         norm_confluencia = (score_confluencia / 35.0) * 100.0
         norm_institucional = (score_institucional / 35.0) * 100.0

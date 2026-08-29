@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
 """
-noticias/sistema_noticias.py (V8.0 - REFACTORIZADO)
+noticias/sistema_noticias.py (V9.2 - REFACTORIZADO)
 Sistema de Noticias con Ponderación Temporal y Aprovechamiento de Divisas.
 
-MEJORAS V8.0:
-- Integración con LoggerPersistente (logs unificados)
-- Integración con AlmacenamientoSQLite (persistencia en DB)
-- Integración con DataCache (caché de COT unificada)
-- Configuración centralizada desde Config
-- Límite de eventos en memoria (máximo 200)
-- Limpieza automática de eventos antiguos (>7 días)
-- Estadísticas de uso
-- Paths usando BASE_DIR
-- Soporte para fecha_referencia en todos los métodos (para backtesting)
+MEJORAS V9.2:
+- Eliminada dependencia circular con fuentes.py
+- Importa EventoNoticia e ImpactoNoticia desde eventos.py
+- Código más limpio y mantenible
 """
 
 import os
@@ -26,14 +20,20 @@ import feedparser
 from functools import wraps
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple, Set
-from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv()
 import threading
 
 # ============================================================
-# IMPORTS DE NUEVOS MÓDULOS (V8.0)
+# IMPORTS DE MÓDULOS INTERNOS
 # ============================================================
+
+from noticias.eventos import ImpactoNoticia, EventoNoticia
+from noticias.fuentes import (
+    FuenteFMP, FuenteFinnhub, FuenteDailyFX,
+    FuenteForexFactory, FuenteInvestingRSS
+)
 
 try:
     from utils.logger_persistente import LoggerPersistente
@@ -48,7 +48,7 @@ except ImportError:
     Config = None
 
 try:
-    from utils.cache_data import DataCache
+    from utils.cache import CacheUnificado
 except ImportError:
     DataCache = None
 
@@ -57,37 +57,16 @@ try:
 except ImportError:
     AlmacenamientoSQLite = None
 
-# ============================================================
-# IMPORTS LEGACY (Compatibilidad)
-# ============================================================
-
-try:
-    from utils.retry import retry_http
-except ImportError:
-    def retry_http(max_retries=3, base_delay=1.0):
-        def decorator(func):
-            @wraps(func)
-            def wrapper(*args, **kwargs):
-                for attempt in range(1, max_retries + 1):
-                    try:
-                        return func(*args, **kwargs)
-                    except Exception as e:
-                        if attempt == max_retries:
-                            raise
-                        time.sleep(base_delay * attempt)
-            return wrapper
-        return decorator
-
-try:
-    from utils.crypto_client import FreeCryptoAPIClient
-except ImportError:
-    FreeCryptoAPIClient = None
-
 try:
     from config.news_keywords import PALABRAS_CLAVE_IMPACTO, KEYWORDS_DIVISAS_NLP
 except ImportError:
     PALABRAS_CLAVE_IMPACTO = {}
     KEYWORDS_DIVISAS_NLP = {}
+
+try:
+    from utils.crypto_client import FreeCryptoAPIClient
+except ImportError:
+    FreeCryptoAPIClient = None
 
 # ============================================================
 # CONSTANTES
@@ -101,105 +80,6 @@ DIAS_PARA_LIMPIAR = 7
 COT_CACHE_TTL_HORAS = 48
 
 
-class ImpactoNoticia(Enum):
-    CRITICO = 4
-    ALTO = 3
-    MEDIO = 2
-    BAJO = 1
-    IRRELEVANTE = 0
-
-
-# ============================================================
-# DATACLASS DE EVENTO
-# ============================================================
-
-@dataclass
-class EventoNoticia:
-    nombre: str
-    divisa: str
-    impacto: ImpactoNoticia
-    hora: datetime
-    sentimiento_esperado: float = 0.0
-    fuente: str = ""
-    descripcion: str = ""
-    pais: str = ""
-    actual: Optional[float] = None
-    previo: Optional[float] = None
-    consenso: Optional[float] = None
-    
-    hora_inicio_ventana: Optional[datetime] = None
-    hora_fin_ventana: Optional[datetime] = None
-    hora_pico: Optional[datetime] = None
-    
-    def __post_init__(self):
-        if self.hora_inicio_ventana is None:
-            self.hora_inicio_ventana = self.hora - timedelta(hours=2)
-        if self.hora_fin_ventana is None:
-            self.hora_fin_ventana = self.hora + timedelta(hours=2)
-        if self.hora_pico is None:
-            self.hora_pico = self.hora
-    
-    def ponderacion_actual(self, momento: datetime) -> float:
-        """Calcula la ponderación actual del evento."""
-        if momento.tzinfo is None:
-            momento = momento.replace(tzinfo=timezone.utc)
-        if self.hora.tzinfo is None:
-            self.hora = self.hora.replace(tzinfo=timezone.utc)
-        if self.hora_inicio_ventana.tzinfo is None:
-            self.hora_inicio_ventana = self.hora_inicio_ventana.replace(tzinfo=timezone.utc)
-        if self.hora_fin_ventana.tzinfo is None:
-            self.hora_fin_ventana = self.hora_fin_ventana.replace(tzinfo=timezone.utc)
-        
-        if momento < self.hora_inicio_ventana or momento > self.hora_fin_ventana:
-            return 0.0
-        
-        if momento < self.hora:
-            horas_antes = (self.hora - momento).total_seconds() / 3600.0
-            ponderacion = 1.0 - (horas_antes / 2.0) ** 1.5
-        else:
-            horas_despues = (momento - self.hora).total_seconds() / 3600.0
-            ponderacion = max(0.0, 1.0 - (horas_despues / 2.0) ** 1.2)
-        
-        return max(0.0, min(1.0, ponderacion))
-    
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            'nombre': self.nombre,
-            'divisa': self.divisa,
-            'impacto': self.impacto.value,
-            'hora': self.hora.isoformat(),
-            'sentimiento_esperado': self.sentimiento_esperado,
-            'fuente': self.fuente,
-            'descripcion': self.descripcion,
-            'pais': self.pais,
-            'actual': self.actual,
-            'previo': self.previo,
-            'consenso': self.consenso,
-            'hora_inicio_ventana': self.hora_inicio_ventana.isoformat() if self.hora_inicio_ventana else None,
-            'hora_fin_ventana': self.hora_fin_ventana.isoformat() if self.hora_fin_ventana else None,
-            'hora_pico': self.hora_pico.isoformat() if self.hora_pico else None,
-        }
-    
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'EventoNoticia':
-        return cls(
-            nombre=data.get('nombre', ''),
-            divisa=data.get('divisa', 'ALL'),
-            impacto=ImpactoNoticia(data.get('impacto', 0)),
-            hora=datetime.fromisoformat(data['hora']),
-            sentimiento_esperado=data.get('sentimiento_esperado', 0.0),
-            fuente=data.get('fuente', ''),
-            descripcion=data.get('descripcion', ''),
-            pais=data.get('pais', ''),
-            actual=data.get('actual'),
-            previo=data.get('previo'),
-            consenso=data.get('consenso'),
-            hora_inicio_ventana=datetime.fromisoformat(data['hora_inicio_ventana']) if data.get('hora_inicio_ventana') else None,
-            hora_fin_ventana=datetime.fromisoformat(data['hora_fin_ventana']) if data.get('hora_fin_ventana') else None,
-            hora_pico=datetime.fromisoformat(data['hora_pico']) if data.get('hora_pico') else None,
-        )
-
-
 # ============================================================
 # CLASE PRINCIPAL
 # ============================================================
@@ -207,7 +87,7 @@ class EventoNoticia:
 class SistemaNoticias:
     """
     Sistema completo de noticias con ponderación temporal y deduplicación.
-    V8.0: Integración con nuevos módulos.
+    V9.2 - REFACTORIZADO.
     """
 
     def __init__(self, config=None, notificador=None, almacen=None, data_cache=None):
@@ -246,6 +126,13 @@ class SistemaNoticias:
             except Exception as e:
                 self.logger.warning(f"No se pudo inicializar FreeCryptoAPIClient: {e}")
         
+        # ============================================================
+        # INICIALIZAR FUENTES DE NOTICIAS
+        # ============================================================
+        
+        self._fuentes = self._inicializar_fuentes()
+        self.logger.info(f"📰 {len(self._fuentes)} fuentes de noticias inicializadas")
+        
         # Palabras clave
         self.palabras_clave = PALABRAS_CLAVE_IMPACTO
         self.keywords_divisas = KEYWORDS_DIVISAS_NLP
@@ -263,24 +150,13 @@ class SistemaNoticias:
             'War', 'Guerra', 'Nuclear', 'Black Swan'
         ]
         
-        # Fuentes RSS
-        self.fuentes = [
-            'https://feeds.reuters.com/reuters/businessNews',
-            'https://www.cnbc.com/id/100727362/device/rss/rss.html',
-            'https://www.marketwatch.com/rss/topstories',
-            'https://finance.yahoo.com/news/rssindex'
-        ]
-        
         # Cargar datos desde almacenamiento
         self._cargar_desde_almacen()
         
-        self.logger.info(f"📰 SistemaNoticias V8.0 inicializado")
+        self.logger.info(f"📰 SistemaNoticias V9.2 inicializado")
         self.logger.info(f"   Eventos: {len(self.eventos)}")
         self.logger.info(f"   Noticias: {len(self.noticias)}")
-    
-    # ============================================================
-    # CONFIGURACIÓN
-    # ============================================================
+        self.logger.info(f"   Fuentes: {len(self._fuentes)}")
     
     def _cargar_configuracion(self):
         """Carga configuración desde Config."""
@@ -299,6 +175,43 @@ class SistemaNoticias:
         self.lote_bonus = getattr(self.config, 'LOTE_BONUS_NOTICIA_FAVORABLE', 1.3)
         self.lote_penalty = getattr(self.config, 'LOTE_PENALTY_NOTICIA_CONTRA', 0.7)
         self.cache_ttl_minutos = getattr(self.config, 'MINUTOS_CACHE_NOTICIAS', 5)
+    
+    def _inicializar_fuentes(self) -> List:
+        """Inicializa las fuentes de noticias con manejo de errores."""
+        fuentes = []
+        
+        # ✅ OBTENER KEYS DEL ENTORNO
+        import os
+        fmp_key = os.getenv('FMP_API_KEY', '')
+        finnhub_key = os.getenv('FINNHUB_API_KEY', '')
+        
+        # ✅ LOG DE DIAGNÓSTICO
+        self.logger.info(f"🔑 FMP_API_KEY: {'✅' if fmp_key else '❌'} Configurada")
+        self.logger.info(f"🔑 FINNHUB_API_KEY: {'✅' if finnhub_key else '❌'} Configurada")
+        
+        # ✅ FMP
+        if fmp_key:
+            try:
+                fuentes.append(FuenteFMP(fmp_key))
+                self.logger.info(f"📰 Fuente FMP añadida")
+            except Exception as e:
+                self.logger.warning(f"⚠️ FMP no disponible: {e}")
+        
+        # ✅ Finnhub
+        if finnhub_key:
+            try:
+                fuentes.append(FuenteFinnhub(finnhub_key))
+                self.logger.info(f"📰 Fuente Finnhub añadida")
+            except Exception as e:
+                self.logger.warning(f"⚠️ Finnhub no disponible: {e}")
+        
+        # ✅ Fuentes gratuitas
+        fuentes.append(FuenteDailyFX())
+        fuentes.append(FuenteForexFactory())
+        fuentes.append(FuenteInvestingRSS())
+        
+        self.logger.info(f"📰 {len(fuentes)} fuentes de noticias inicializadas")
+        return fuentes
     
     # ============================================================
     # ALMACENAMIENTO (SQLite + JSON Fallback)
@@ -446,59 +359,28 @@ class SistemaNoticias:
         
         return False
     
-    def _cargar_noticias_rss(self) -> bool:
-        """Carga noticias RSS desde JSON (fallback)."""
-        ruta_noticias = DATA_DIR / "noticias_rss.json"
-        if not ruta_noticias.exists():
-            return False
-        
+    def _guardar_noticias_rss(self):
+        """Guarda noticias RSS en JSON (fallback)."""
         try:
-            with open(ruta_noticias, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+            ruta_noticias = DATA_DIR / "noticias_rss.json"
+            ruta_noticias.parent.mkdir(parents=True, exist_ok=True)
             
-            if not isinstance(data, list):
-                return False
+            temp_path = ruta_noticias.with_suffix('.tmp')
+            noticias_para_guardar = []
+            for n in self.noticias[:MAX_NOTICIAS_MEMORIA]:
+                fecha = n.get('fecha')
+                if isinstance(fecha, datetime):
+                    fecha = fecha.isoformat()
+                noticias_para_guardar.append({
+                    **n,
+                    'fecha': fecha
+                })
             
-            noticias_cargadas = []
-            for item in data:
-                try:
-                    fecha_str = item.get('fecha')
-                    if not fecha_str:
-                        continue
-                    
-                    # Convertir a datetime
-                    if isinstance(fecha_str, str):
-                        fecha = datetime.fromisoformat(fecha_str)
-                        if fecha.tzinfo is None:
-                            fecha = fecha.replace(tzinfo=timezone.utc)
-                    elif isinstance(fecha_str, datetime):
-                        fecha = fecha_str
-                    else:
-                        fecha = datetime.now(timezone.utc)
-                    
-                    noticia = {
-                        'fecha': fecha,  # <-- Siempre datetime
-                        'titulo': item.get('titulo', ''),
-                        'sentimiento': item.get('sentimiento', 0.0),
-                        'impacto': item.get('impacto', 0.0),
-                        'divisa': item.get('divisa', 'ALL'),
-                        'texto': item.get('texto', ''),
-                        'fuente': item.get('fuente', ''),
-                        'url': item.get('url', '')
-                    }
-                    noticias_cargadas.append(noticia)
-                except Exception as e:
-                    self.logger.debug(f"Error procesando noticia: {e}")
-                    continue
-            
-            if noticias_cargadas:
-                self.noticias = noticias_cargadas[-MAX_NOTICIAS_MEMORIA:]
-                self.logger.info(f"📰 {len(self.noticias)} noticias RSS cargadas desde JSON")
-                return True
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(noticias_para_guardar, f, indent=2, ensure_ascii=False)
+            temp_path.replace(ruta_noticias)
         except Exception as e:
-            self.logger.warning(f"Error cargando noticias RSS: {e}")
-    
-        return False
+            self.logger.warning(f"Error guardando noticias RSS: {e}")
     
     def _limpiar_eventos_antiguos(self):
         """Limpia eventos más antiguos que DIAS_PARA_LIMPIAR."""
@@ -668,7 +550,7 @@ class SistemaNoticias:
     def obtener_cot_fmp(self, divisa: str, fecha_referencia: Optional[datetime] = None) -> float:
         """
         Obtiene el COT para una divisa o activo.
-        V8.0: Usa DataCache si está disponible.
+        V9.1 - Usa DataCache si está disponible.
         
         Args:
             divisa: Código de divisa (EUR, USD, etc.)
@@ -848,21 +730,49 @@ class SistemaNoticias:
         self.logger.info("✅ Actualización COT completada")
     
     # ============================================================
-    # MÉTODOS PÚBLICOS
+    # MÉTODOS DE ACTUALIZACIÓN
     # ============================================================
     
     def actualizar(self, forzar: bool = False) -> bool:
         """Actualiza fuentes de noticias."""
         self.logger.info("🔄 Actualizando fuentes de noticias...")
         
-        exito_calendario = self._actualizar_calendario(forzar)
-        self._actualizar_noticias()
+        nuevos_eventos = []
         
-        if exito_calendario or self.eventos:
+        # Iterar sobre todas las fuentes
+        for fuente in self._fuentes:
+            try:
+                eventos = fuente.obtener_eventos()
+                nuevos_eventos.extend(eventos)
+            except Exception as e:
+                self.logger.warning(f"⚠️ Error en fuente {fuente.nombre}: {e}")
+                continue
+        
+        if nuevos_eventos:
+            # Deduplicar eventos (por nombre, divisa y hora)
+            vistos = set()
+            eventos_unicos = []
+            for ev in nuevos_eventos:
+                clave = (ev.nombre, ev.divisa, ev.hora.strftime('%Y-%m-%d %H:%M'))
+                if clave not in vistos:
+                    vistos.add(clave)
+                    eventos_unicos.append(ev)
+            
+            # Reemplazar eventos
+            with self._eventos_lock:
+                self.eventos = eventos_unicos
+            
+            self.logger.info(f"📰 {len(eventos_unicos)} eventos únicos cargados desde {len(self._fuentes)} fuentes")
             self._guardar_en_almacen()
             self._ultima_actualizacion_calendario = datetime.now(timezone.utc)
+            return True
         
-        return exito_calendario
+        self.logger.info("📭 No se cargaron eventos nuevos")
+        return False
+    
+    # ============================================================
+    # MÉTODOS PÚBLICOS
+    # ============================================================
     
     def obtener_sentimiento_divisa(self, divisa: str, fecha_referencia: Optional[datetime] = None) -> float:
         """Obtiene sentimiento de una divisa."""
@@ -1178,474 +1088,6 @@ class SistemaNoticias:
             return None
     
     # ============================================================
-    # MÉTODOS DE ACTUALIZACIÓN DE CALENDARIO
-    # ============================================================
-    
-    def _actualizar_calendario(self, forzar: bool = False) -> bool:
-        """Actualiza el calendario de eventos."""
-        if not forzar and self.eventos and self._ultima_actualizacion_calendario:
-            if (datetime.now(timezone.utc) - self._ultima_actualizacion_calendario).total_seconds() < 3600:
-                return True
-        
-        # Obtener API keys
-        fmp_key = ''
-        finnhub_key = ''
-        
-        if self.config is not None:
-            fmp_key = getattr(self.config, 'FMP_API_KEY', '')
-            finnhub_key = getattr(self.config, 'FINNHUB_API_KEY', '')
-        
-        if not fmp_key or not finnhub_key:
-            try:
-                from config.settings import Config
-                if not fmp_key:
-                    fmp_key = Config.FMP_API_KEY
-                if not finnhub_key:
-                    finnhub_key = Config.FINNHUB_API_KEY
-            except Exception:
-                pass
-        
-        if fmp_key and self._actualizar_calendario_fmp(fmp_key):
-            self._ultima_actualizacion_calendario = datetime.now(timezone.utc)
-            return True
-        
-        if finnhub_key and self._actualizar_calendario_finnhub(finnhub_key):
-            self._ultima_actualizacion_calendario = datetime.now(timezone.utc)
-            return True
-        
-        if self._actualizar_calendario_dailyfx():
-            self._ultima_actualizacion_calendario = datetime.now(timezone.utc)
-            return True
-        
-        if self._actualizar_calendario_forexfactory():
-            self._ultima_actualizacion_calendario = datetime.now(timezone.utc)
-            return True
-        
-        return False
-    
-    @retry_http(max_retries=3, base_delay=1.5)
-    def _actualizar_calendario_fmp(self, api_key: str) -> bool:
-        """Actualiza calendario desde FMP."""
-        try:
-            fecha_inicio = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-            fecha_fin = (datetime.now(timezone.utc) + timedelta(days=7)).strftime('%Y-%m-%d')
-            url = f"https://financialmodelingprep.com/stable/economic-calendar?from={fecha_inicio}&to={fecha_fin}"
-            headers = {'apikey': api_key}
-            response = requests.get(url, headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                datos = response.json()
-                eventos_procesados = []
-                
-                for item in datos:
-                    try:
-                        fecha_str = item.get('date', '')
-                        if not fecha_str:
-                            continue
-                        
-                        try:
-                            hora = datetime.strptime(fecha_str, '%Y-%m-%d %H:%M:%S')
-                        except ValueError:
-                            hora = datetime.fromisoformat(fecha_str)
-                        hora = hora.replace(tzinfo=timezone.utc)
-                        
-                        nombre = item.get('event', 'Evento Económico')
-                        divisa = item.get('currency', 'ALL').upper()
-                        impacto_str = item.get('impact', 'Low')
-                        
-                        impacto = ImpactoNoticia.MEDIO
-                        if impacto_str == 'High':
-                            impacto = ImpactoNoticia.ALTO
-                        elif impacto_str == 'Low':
-                            impacto = ImpactoNoticia.BAJO
-                        
-                        sentimiento = self._predecir_sentimiento_evento(nombre, divisa)
-                        
-                        evento = EventoNoticia(
-                            nombre=nombre, divisa=divisa, impacto=impacto, hora=hora,
-                            sentimiento_esperado=sentimiento, fuente='FMP',
-                            descripcion=item.get('description', ''),
-                            pais=item.get('country', ''),
-                            actual=item.get('actual'), previo=item.get('previous'),
-                            consenso=item.get('consensus'),
-                        )
-                        eventos_procesados.append(evento)
-                    except Exception:
-                        continue
-                
-                if eventos_procesados:
-                    vistos = set()
-                    eventos_unicos = []
-                    for ev in eventos_procesados:
-                        clave = (ev.nombre, ev.divisa, ev.hora.strftime('%Y-%m-%d %H:%M'))
-                        if clave not in vistos:
-                            vistos.add(clave)
-                            eventos_unicos.append(ev)
-                    
-                    with self._eventos_lock:
-                        self.eventos = eventos_unicos
-                    
-                    self.logger.info(f"📰 FMP: {len(eventos_unicos)} eventos únicos cargados")
-                    self._guardar_en_almacen()
-                    return True
-        except Exception as e:
-            self.logger.warning(f"FMP calendario: {e}")
-        
-        return False
-    
-    @retry_http(max_retries=3, base_delay=1.5)
-    def _actualizar_calendario_finnhub(self, api_key: str) -> bool:
-        """Actualiza calendario desde Finnhub."""
-        try:
-            url = f"https://finnhub.io/api/v1/calendar/economic?token={api_key}"
-            response = requests.get(url, timeout=10)
-            
-            if response.status_code == 200:
-                datos = response.json().get('economicCalendar', [])
-                eventos_procesados = []
-                
-                for item in datos:
-                    try:
-                        fecha_str = item.get('time', '')
-                        if not fecha_str:
-                            continue
-                        
-                        hora = datetime.strptime(fecha_str, '%Y-%m-%d %H:%M:%S')
-                        hora = hora.replace(tzinfo=timezone.utc)
-                        
-                        nombre = item.get('event', 'Evento Económico')
-                        divisa = item.get('country', 'ALL').upper()
-                        impacto_str = item.get('impact', 'low')
-                        
-                        impacto = ImpactoNoticia.MEDIO
-                        if impacto_str == 'high':
-                            impacto = ImpactoNoticia.ALTO
-                        elif impacto_str == 'low':
-                            impacto = ImpactoNoticia.BAJO
-                        
-                        sentimiento = self._predecir_sentimiento_evento(nombre, divisa)
-                        
-                        evento = EventoNoticia(
-                            nombre=nombre, divisa=divisa, impacto=impacto, hora=hora,
-                            sentimiento_esperado=sentimiento, fuente='Finnhub',
-                        )
-                        eventos_procesados.append(evento)
-                    except Exception:
-                        continue
-                
-                if eventos_procesados:
-                    vistos = set()
-                    eventos_unicos = []
-                    for ev in eventos_procesados:
-                        clave = (ev.nombre, ev.divisa, ev.hora.strftime('%Y-%m-%d %H:%M'))
-                        if clave not in vistos:
-                            vistos.add(clave)
-                            eventos_unicos.append(ev)
-                    
-                    with self._eventos_lock:
-                        self.eventos = eventos_unicos
-                    
-                    self.logger.info(f"📰 Finnhub: {len(eventos_unicos)} eventos únicos cargados")
-                    self._guardar_en_almacen()
-                    return True
-        except Exception as e:
-            self.logger.warning(f"Finnhub calendario: {e}")
-        
-        return False
-    
-    @retry_http(max_retries=3, base_delay=1.5)
-    def _actualizar_calendario_dailyfx(self) -> bool:
-        """Actualiza calendario desde DailyFX."""
-        try:
-            hoy = datetime.now(timezone.utc)
-            start_date = hoy.strftime('%Y-%m-%dT00:00:00Z')
-            end_date = (hoy + timedelta(days=7)).strftime('%Y-%m-%dT23:59:59Z')
-            url = f"https://www.dailyfx.com/api/v1/calendar?start_date={start_date}&end_date={end_date}"
-            headers = {
-                'Referer': 'https://www.dailyfx.com/economic-calendar',
-                'Accept': 'application/json, text/plain, */*',
-            }
-            response = requests.get(url, headers=headers, timeout=15)
-            
-            if response.status_code == 200:
-                datos = response.json()
-                eventos_procesados = []
-                
-                for item in datos:
-                    try:
-                        fecha_str = item.get('date', '').replace('Z', '+00:00')
-                        hora = datetime.fromisoformat(fecha_str)
-                        if hora.tzinfo is None:
-                            hora = hora.replace(tzinfo=timezone.utc)
-                        
-                        nombre = item.get('title', 'Evento Económico')
-                        divisa = item.get('currency', 'ALL').upper()
-                        imp = item.get('importance', 'low').lower()
-                        
-                        impacto = ImpactoNoticia.MEDIO
-                        if imp == 'high':
-                            impacto = ImpactoNoticia.ALTO
-                        elif imp == 'medium':
-                            impacto = ImpactoNoticia.MEDIO
-                        else:
-                            impacto = ImpactoNoticia.BAJO
-                        
-                        sentimiento = self._predecir_sentimiento_evento(nombre, divisa)
-                        
-                        evento = EventoNoticia(
-                            nombre=nombre, divisa=divisa, impacto=impacto, hora=hora,
-                            sentimiento_esperado=sentimiento, fuente='DailyFX',
-                        )
-                        eventos_procesados.append(evento)
-                    except Exception:
-                        continue
-                
-                if eventos_procesados:
-                    vistos = set()
-                    eventos_unicos = []
-                    for ev in eventos_procesados:
-                        clave = (ev.nombre, ev.divisa, ev.hora.strftime('%Y-%m-%d %H:%M'))
-                        if clave not in vistos:
-                            vistos.add(clave)
-                            eventos_unicos.append(ev)
-                    
-                    with self._eventos_lock:
-                        self.eventos = eventos_unicos
-                    
-                    self.logger.info(f"📰 DailyFX: {len(eventos_unicos)} eventos únicos cargados")
-                    self._guardar_en_almacen()
-                    return True
-        except Exception as e:
-            self.logger.warning(f"DailyFX calendario: {e}")
-        
-        return False
-    
-    @retry_http(max_retries=3, base_delay=1.5)
-    def _actualizar_calendario_forexfactory(self) -> bool:
-        """Actualiza calendario desde ForexFactory."""
-        try:
-            url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            response = requests.get(url, headers=headers, timeout=15)
-            
-            if response.status_code == 200:
-                datos = response.json()
-                eventos_procesados = []
-                
-                for item in datos:
-                    try:
-                        fecha_str = item.get('date', '')
-                        if not fecha_str:
-                            continue
-                        
-                        hora = datetime.fromisoformat(fecha_str)
-                        if hora.tzinfo is None:
-                            hora = hora.replace(tzinfo=timezone.utc)
-                        
-                        nombre = item.get('title', 'Evento Económico')
-                        divisa = item.get('country', 'ALL').upper()
-                        imp = item.get('impact', '').lower()
-                        
-                        if imp not in ['high', 'medium']:
-                            continue
-                        
-                        impacto = ImpactoNoticia.ALTO if imp == 'high' else ImpactoNoticia.MEDIO
-                        sentimiento = self._predecir_sentimiento_evento(nombre, divisa)
-                        
-                        evento = EventoNoticia(
-                            nombre=nombre, divisa=divisa, impacto=impacto, hora=hora,
-                            sentimiento_esperado=sentimiento, fuente='ForexFactory',
-                        )
-                        eventos_procesados.append(evento)
-                    except Exception:
-                        continue
-                
-                if eventos_procesados:
-                    vistos = set()
-                    eventos_unicos = []
-                    for ev in eventos_procesados:
-                        clave = (ev.nombre, ev.divisa, ev.hora.strftime('%Y-%m-%d %H:%M'))
-                        if clave not in vistos:
-                            vistos.add(clave)
-                            eventos_unicos.append(ev)
-                    
-                    with self._eventos_lock:
-                        self.eventos = eventos_unicos
-                    
-                    self.logger.info(f"📰 ForexFactory: {len(eventos_unicos)} eventos únicos cargados")
-                    self._guardar_en_almacen()
-                    return True
-        except Exception as e:
-            self.logger.warning(f"ForexFactory calendario: {e}")
-        
-        return False
-    
-    # ============================================================
-    # MÉTODOS DE NOTICIAS RSS
-    # ============================================================
-    
-    def _actualizar_noticias(self):
-        """Actualiza noticias generales desde RSS con deduplicación."""
-        nuevas_noticias = []
-        titulos_existentes = [n.get('titulo', '') for n in self.noticias if n.get('titulo')]
-        urls_existentes = [n.get('url', '') for n in self.noticias if n.get('url')]
-        max_nuevas = 20
-        
-        for fuente in self.fuentes:
-            if len(nuevas_noticias) >= max_nuevas:
-                break
-            
-            try:
-                feed = feedparser.parse(fuente)
-                for entry in feed.entries[:5]:
-                    if len(nuevas_noticias) >= max_nuevas:
-                        break
-                    
-                    titulo = entry.title
-                    url = entry.get('link', '')
-                    
-                    if self._es_noticia_similar(titulo, url, titulos_existentes, urls_existentes):
-                        continue
-                    
-                    texto = f"{titulo} {getattr(entry, 'description', '')}"
-                    sentimiento = self._analizar_sentimiento(texto)
-                    impacto = self._calcular_impacto(texto)
-                    divisa = self._extraer_divisa(texto)
-                    
-                    noticia = {
-                        'fecha': datetime.now(timezone.utc),
-                        'titulo': titulo,
-                        'sentimiento': sentimiento,
-                        'impacto': impacto,
-                        'divisa': divisa,
-                        'texto': texto[:500],
-                        'fuente': fuente,
-                        'url': url
-                    }
-                    nuevas_noticias.append(noticia)
-                    titulos_existentes.append(titulo)
-                    if url:
-                        urls_existentes.append(url)
-            except Exception as e:
-                self.logger.debug(f"Error en fuente {fuente}: {e}")
-                continue
-        
-        if nuevas_noticias:
-            # Combinar y ordenar de forma segura
-            todas_noticias = self.noticias + nuevas_noticias
-            
-            def get_fecha_segura(noticia):
-                fecha = noticia.get('fecha')
-                if isinstance(fecha, str):
-                    try:
-                        return datetime.fromisoformat(fecha)
-                    except Exception:
-                        return datetime(2000, 1, 1, tzinfo=timezone.utc)
-                elif isinstance(fecha, datetime):
-                    return fecha
-                return datetime(2000, 1, 1, tzinfo=timezone.utc)
-            
-            todas_noticias.sort(key=get_fecha_segura, reverse=True)
-            self.noticias = todas_noticias[:MAX_NOTICIAS_MEMORIA]
-            self.logger.info(f"📰 {len(nuevas_noticias)} noticias nuevas añadidas (total {len(self.noticias)})")
-            self._guardar_en_almacen()
-        else:
-            self.logger.info("📭 No se añadieron noticias nuevas")
-    # ============================================================
-    # MÉTODOS DE COMPATIBILIDAD (LEGACY)
-    # ============================================================
-    
-    def actualizar_calendario_fmp(self, api_key: str) -> bool:
-        return self._actualizar_calendario_fmp(api_key)
-    
-    def actualizar_calendario_finnhub(self, api_key: str) -> bool:
-        return self._actualizar_calendario_finnhub(api_key)
-    
-    def actualizar_calendario_dailyfx(self) -> bool:
-        return self._actualizar_calendario_dailyfx()
-    
-    def actualizar_calendario_forexfactory(self) -> bool:
-        return self._actualizar_calendario_forexfactory()
-    
-    def actualizar_calendario_investing_rss(self) -> bool:
-        return self._actualizar_calendario_investing_rss()
-    
-    @retry_http(max_retries=3, base_delay=1.5)
-    def _actualizar_calendario_investing_rss(self) -> bool:
-        """Actualiza calendario desde Investing RSS."""
-        try:
-            url = "https://www.investing.com/rss/news.rss"
-            feed = feedparser.parse(url)
-            
-            if not feed.entries:
-                return False
-            
-            eventos_procesados = []
-            for entry in feed.entries[:10]:
-                try:
-                    titulo = entry.title
-                    desc = getattr(entry, 'description', '')
-                    texto = f"{titulo} {desc}"
-                    divisa = self._extraer_divisa(texto)
-                    
-                    if divisa == 'ALL':
-                        continue
-                    
-                    sentimiento = self._analizar_sentimiento(texto)
-                    if abs(sentimiento) < 0.1:
-                        continue
-                    
-                    pub_date = entry.get('published', '')
-                    if not pub_date:
-                        continue
-                    
-                    try:
-                        hora = datetime.strptime(pub_date, '%a, %d %b %Y %H:%M:%S %z')
-                        if hora.tzinfo is None:
-                            hora = hora.replace(tzinfo=timezone.utc)
-                    except:
-                        continue
-                    
-                    impacto = ImpactoNoticia.MEDIO if abs(sentimiento) > 0.5 else ImpactoNoticia.BAJO
-                    evento = EventoNoticia(
-                        nombre=titulo[:80], divisa=divisa, impacto=impacto, hora=hora,
-                        sentimiento_esperado=sentimiento, fuente='Investing_RSS',
-                        descripcion=desc[:200],
-                    )
-                    eventos_procesados.append(evento)
-                except Exception:
-                    continue
-            
-            if eventos_procesados:
-                vistos = set()
-                eventos_unicos = []
-                for ev in eventos_procesados:
-                    clave = (ev.nombre, ev.divisa, ev.hora.strftime('%Y-%m-%d %H:%M'))
-                    if clave not in vistos:
-                        vistos.add(clave)
-                        eventos_unicos.append(ev)
-                
-                with self._eventos_lock:
-                    self.eventos.extend(eventos_unicos)
-                    # Deduplicar globalmente
-                    vistos_global = set()
-                    eventos_global = []
-                    for ev in self.eventos:
-                        clave = (ev.nombre, ev.divisa, ev.hora.strftime('%Y-%m-%d %H:%M'))
-                        if clave not in vistos_global:
-                            vistos_global.add(clave)
-                            eventos_global.append(ev)
-                    self.eventos = eventos_global
-                
-                self._guardar_en_almacen()
-                self.logger.info(f"📰 Investing RSS: {len(eventos_unicos)} eventos añadidos")
-                return True
-        except Exception as e:
-            self.logger.warning(f"Investing RSS calendario: {e}")
-        
-        return False
-    
-    # ============================================================
     # ESTADÍSTICAS
     # ============================================================
     
@@ -1664,4 +1106,5 @@ class SistemaNoticias:
             'ultima_actualizacion': self._ultima_actualizacion_calendario.isoformat() if self._ultima_actualizacion_calendario else None,
             'cftc_failures': self._cftc_failure_count,
             'cache_sentimiento_size': len(self._cache_sentimiento_divisa),
+            'fuentes_activas': len(self._fuentes),
         }

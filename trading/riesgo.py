@@ -1,22 +1,14 @@
 #!/usr/bin/env python3
 """
-trading/riesgo.py (V9.0 - REFACTORIZADO COMPLETAMENTE)
+trading/riesgo.py (V9.65 - CORREGIDO DEFINITIVO)
 Sistema de Gestión de Riesgo para el Bot de Trading.
 
-RESPONSABILIDADES:
-- Gestión de capital y drawdown
-- Circuit Breaker
-- Registro de operaciones
-- Estadísticas de rendimiento
-- Control de pérdidas consecutivas
-
-MEJORAS V9.0:
-- Separación de responsabilidades en submódulos
-- Integración con umbrales centralizados
-- Cálculo de lotes optimizado
-- Circuit Breaker independiente
-- Validaciones robustas
-- Logs más informativos
+V9.65 - CORRECCIONES CRÍTICAS:
+- ✅ Obtiene capital REAL de MT5
+- ✅ Verifica margen disponible real
+- ✅ Previene operaciones con capital insuficiente
+- ✅ Validación de lotes con límites estrictos por activo
+- ✅ Contador de pérdidas por símbolo con alertas
 """
 
 import logging
@@ -40,7 +32,7 @@ logger = logging.getLogger('BotTrading.Riesgo')
 class GestionRiesgo:
     """
     Gestión de riesgo completa para el bot.
-    V9.0 - REFACTORIZADO COMPLETAMENTE.
+    V9.65 - CORREGIDO DEFINITIVO.
     """
     
     def __init__(self,
@@ -49,17 +41,11 @@ class GestionRiesgo:
                  almacen: Optional[Any] = None,
                  notificador: Optional[Any] = None,
                  config: Optional[Any] = None,
-                 modo_backtest: bool = False):
+                 modo_backtest: bool = False,
+                 mt5: Optional[Any] = None):
         """
         Inicializa la gestión de riesgo.
-        
-        Args:
-            capital_inicial: Capital inicial
-            aporte_mensual: Aporte mensual
-            almacen: Almacenamiento SQLite
-            notificador: Sistema de notificaciones
-            config: Configuración
-            modo_backtest: Modo backtest
+        V9.65 - CORREGIDO: Usa capital real de MT5 si está disponible.
         """
         getcontext().prec = 10
         
@@ -67,19 +53,36 @@ class GestionRiesgo:
         self.almacen = almacen
         self.notificador = notificador
         self.modo_backtest = modo_backtest
+        self.mt5 = mt5
         self.logger = logging.getLogger('BotTrading.Riesgo')
         
         # ============================================================
-        # 1. CAPITAL
+        # 1. CAPITAL (✅ CORREGIDO V9.65)
         # ============================================================
         
-        self.capital_inicial = Decimal(str(capital_inicial))
-        self.capital_actual = Decimal(str(capital_inicial))
-        self.total_aportado = Decimal(str(capital_inicial))
-        self.aporte_mensual = Decimal(str(aporte_mensual))
+        # ✅ Intentar obtener capital desde MT5 primero
+        capital_desde_mt5 = None
+        if not modo_backtest and mt5 is not None:
+            try:
+                cuenta = mt5.info_cuenta()
+                if cuenta and cuenta.get('balance', 0) > 0:
+                    capital_desde_mt5 = Decimal(str(cuenta['balance']))
+            except Exception:
+                pass
+        
+        if capital_desde_mt5 is not None:
+            self.capital_inicial = capital_desde_mt5
+            self.capital_actual = capital_desde_mt5
+            self.total_aportado = capital_desde_mt5
+            self.logger.info(f"💰 Capital desde MT5: ${float(self.capital_actual):,.2f}")
+        else:
+            self.capital_inicial = Decimal(str(capital_inicial))
+            self.capital_actual = Decimal(str(capital_inicial))
+            self.total_aportado = Decimal(str(capital_inicial))
+            self.logger.info(f"💰 Capital inicial (config): ${float(self.capital_actual):,.2f}")
         
         # Historial de capital
-        self.historial_capital = [Decimal(str(capital_inicial))]
+        self.historial_capital = [self.capital_actual]
         
         # ============================================================
         # 2. APORTES
@@ -129,33 +132,38 @@ class GestionRiesgo:
         self.sim_current_time: Optional[datetime] = None
         
         # ============================================================
-        # 8. CARGAR ESTADO
+        # 8. CARGAR ESTADO (✅ CORREGIDO V9.65)
         # ============================================================
         
         self._cargar_estado()
         
-        self.logger.info(f"💰 GestionRiesgo V9.0 inicializado")
+        self.logger.info(f"💰 GestionRiesgo V9.65 CORREGIDO inicializado")
         self.logger.info(f"   Capital: ${float(self.capital_actual):,.2f}")
         self.logger.info(f"   Backtest: {modo_backtest}")
+        self.logger.info(f"   MT5: {'✅' if mt5 else '❌'}")
     
     # ============================================================
     # CARGA DE ESTADO
     # ============================================================
     
     def _cargar_estado(self):
-        """Carga estado desde almacenamiento."""
+        """
+        Carga estado desde almacenamiento.
+        V9.65 - CORREGIDO: No sobrescribe capital si ya viene de MT5.
+        """
         if not self.almacen:
             return
         
         try:
             config = self.almacen.obtener_configuracion()
             
-            # Capital
-            last_cap = config.get('capital_actual')
-            if last_cap is not None:
-                self.capital_actual = Decimal(str(float(last_cap)))
-                self.total_aportado = Decimal(str(float(config.get('total_aportado', last_cap))))
-                self.logger.info(f"💰 Capital restaurado: ${float(self.capital_actual):,.2f}")
+            # Capital (✅ SOLO si no vino de MT5)
+            if self.capital_actual == self.capital_inicial and not self.modo_backtest:
+                last_cap = config.get('capital_actual')
+                if last_cap is not None and float(last_cap) > 0:
+                    self.capital_actual = Decimal(str(float(last_cap)))
+                    self.total_aportado = Decimal(str(float(config.get('total_aportado', last_cap))))
+                    self.logger.info(f"💰 Capital restaurado: ${float(self.capital_actual):,.2f}")
             
             # Etapa
             etapa = config.get('ultima_etapa')
@@ -202,6 +210,94 @@ class GestionRiesgo:
             self.logger.warning(f"Error guardando estado: {e}")
     
     # ============================================================
+    # ✅ NUEVO V9.65: OBTENER CAPITAL REAL DE MT5
+    # ============================================================
+    
+    def obtener_capital_real(self) -> float:
+        """
+        Obtiene capital REAL desde MT5.
+        V9.65 - CRÍTICO: Siempre usar capital actualizado.
+        
+        Returns:
+            Capital actual en USD
+        """
+        if self.modo_backtest or self.mt5 is None:
+            return float(self.capital_actual)
+        
+        try:
+            cuenta = self.mt5.info_cuenta()
+            if cuenta and cuenta.get('balance', 0) > 0:
+                balance_real = float(cuenta['balance'])
+                
+                # Actualizar si es diferente
+                if Decimal(str(balance_real)) != self.capital_actual:
+                    self.logger.info(f"💰 Capital actualizado desde MT5: ${balance_real:,.2f}")
+                    self.capital_actual = Decimal(str(balance_real))
+                    self.historial_capital.append(self.capital_actual)
+                
+                return balance_real
+        except Exception as e:
+            self.logger.warning(f"⚠️ Error obteniendo capital de MT5: {e}")
+        
+        return float(self.capital_actual)
+
+    def _obtener_tamano_contrato(self, simbolo: str) -> float:
+        """
+        Obtiene el tamaño del contrato para cada símbolo.
+        V9.1 - NUEVO: Para calcular valor de pip en USD correctamente.
+        """
+        simbolo_upper = simbolo.upper()
+        
+        # FOREX: 100,000 unidades
+        if len(simbolo_upper) == 6:
+            return 100000.0
+        
+        # METALES
+        if 'XAU' in simbolo_upper:
+            return 100.0  # 1 lote = 100 onzas
+        if 'XAG' in simbolo_upper:
+            return 5000.0  # 1 lote = 5,000 onzas
+        
+        # ÍNDICES
+        if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500', 'SP500']):
+            return 1.0  # 1 lote = 1 contrato
+        
+        # CRIPTO
+        if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
+            return 1.0  # 1 lote = 1 unidad
+        
+        return 100000.0  # Default
+    
+    def obtener_margen_libre(self) -> float:
+        """
+        Obtiene margen libre REAL desde MT5.
+        V9.65 - CORREGIDO DEFINITIVO: Usa claves correctas.
+        """
+        if self.modo_backtest or self.mt5 is None:
+            return float(self.capital_actual) * 0.8  # Estimación
+        
+        try:
+            cuenta = self.mt5.info_cuenta()
+            if cuenta:
+                # ✅ CORREGIDO: Usar 'margen_libre' (español)
+                margen_libre = float(cuenta.get('margen_libre', 0) or 0)
+                
+                # ✅ FALLBACK: Si 'margen_libre' no existe, usar 'margin_free'
+                if margen_libre <= 0:
+                    margen_libre = float(cuenta.get('margin_free', 0) or 0)
+                
+                # ✅ Si todavía es 0, usar equity como aproximación
+                if margen_libre <= 0:
+                    margen_libre = float(cuenta.get('equity', 0) or 0)
+                
+                self.logger.info(f"💰 Margen libre obtenido: ${margen_libre:.2f}")
+                return margen_libre
+        except Exception as e:
+            self.logger.warning(f"⚠️ Error obteniendo margen libre: {e}")
+        
+        return float(self.capital_actual) * 0.8
+    
+    # ============================================================
     # MÉTODOS PRINCIPALES
     # ============================================================
     
@@ -222,8 +318,10 @@ class GestionRiesgo:
         if self.circuit_breaker.verificar():
             return False, f"Circuit Breaker activo: {self.circuit_breaker.motivo}"
         
-        # 2. Capital
-        if self.capital_actual <= Decimal('1.0'):
+        # 2. ✅ Obtener capital real
+        capital_real = self.obtener_capital_real()
+        
+        if capital_real <= 1.0:
             return False, "Capital insuficiente"
         
         # 3. Límite de operaciones diarias
@@ -248,92 +346,235 @@ class GestionRiesgo:
         if margin_level is not None and margin_level < 200.0:
             return False, "Nivel de margen insuficiente"
         
+        # 8. ✅ VERIFICAR MARGEN LIBRE
+        margen_libre = self.obtener_margen_libre()
+        if margen_libre < 50.0:
+            self.logger.info(f"⚠️ Margen libre bajo: ${margen_libre:.2f}")
+            return False, f"Margen libre insuficiente (${margen_libre:.2f} < $50)"
+        
         return True, "OK"
     
     # ============================================================
-    # CÁLCULO DE LOTES
+    # CÁLCULO DE LOTES (CORREGIDO V9.65)
     # ============================================================
     
-    def calcular_lotes(self,
-                       entrada: float,
-                       stop_loss: float,
-                       probabilidad: float,
-                       tick_value: float = 0.01,
-                       tick_size: float = 0.00001,
-                       point: float = 0.00001,
-                       simbolo: str = "",
-                       atr: float = 0.001,
-                       atr_medio: float = 0.001,
-                       spread: float = 0.0,
-                       margin_level: Optional[float] = None,
-                       equity_referencia: Optional[float] = None) -> float:
+    def calcular_lotes(self, entrada: float, stop_loss: float, 
+                   probabilidad: float, simbolo: str,
+                   capital: Optional[float] = None,
+                   **kwargs) -> float:
         """
-        Calcula el tamaño de posición.
-        
-        Args:
-            entrada: Precio de entrada
-            stop_loss: Precio de stop loss
-            probabilidad: Probabilidad de éxito (0-100)
-            tick_value: Valor del tick
-            tick_size: Tamaño del tick
-            point: Punto del símbolo
-            simbolo: Símbolo
-            atr: ATR actual
-            atr_medio: ATR medio
-            spread: Spread actual
-            margin_level: Nivel de margen
-            equity_referencia: Equity de referencia
-        
-        Returns:
-            Lotes calculados
+        Calcula el tamaño de lote óptimo basado en el riesgo.
+        V9.65 - CORREGIDO: Usa capital REAL de MT5.
         """
-        # Si Circuit Breaker está activo, no calcular lotes
-        if self.circuit_breaker.verificar():
+        from config.umbrales import Umbrales
+        
+        # ============================================================
+        # 1. CAPITAL (✅ OBTENER REAL)
+        # ============================================================
+        if capital is None:
+            capital = self.obtener_capital_real()
+        
+        if capital is None or capital <= 0:
+            self.logger.error(f"❌ {simbolo}: Capital insuficiente")
             return 0.0
         
-        # Capital de referencia
-        cap_ref = float(equity_referencia) if equity_referencia else float(self.capital_actual)
-        if cap_ref <= 0:
-            cap_ref = float(self.capital_actual)
+        if entrada <= 0 or stop_loss <= 0:
+            self.logger.error(f"❌ {simbolo}: Precios inválidos")
+            return 0.0
         
-        # Factores
-        factor_volatilidad = self.calculador_lotes.calcular_factor_volatilidad(atr, entrada) if atr > 0 and entrada > 0 else 1.0
+        # ============================================================
+        # 2. DISTANCIA DEL SL
+        # ============================================================
+        sl_dist = abs(entrada - stop_loss)
+        if sl_dist <= 0:
+            self.logger.error(f"❌ {simbolo}: SL en entrada")
+            return 0.0
         
-        # Factor de convicción (Kelly simplificado)
-        if probabilidad >= 90.0:
-            factor_conviccion = 1.2
-        elif probabilidad >= 80.0:
-            factor_conviccion = 1.0
-        elif probabilidad >= 65.0:
-            factor_conviccion = 0.8
-        else:
-            factor_conviccion = 0.5
+        # ============================================================
+        # 3. PIP SIZE
+        # ============================================================
+        pip_size = kwargs.get('pip_size', 0.0001)
+        if pip_size <= 0:
+            pip_size = self._obtener_pip_size(simbolo)
         
-        # Calcular lotes
-        lotes = self.calculador_lotes.calcular_lotes(
-            entrada=entrada,
-            stop_loss=stop_loss,
-            probabilidad=probabilidad,
-            simbolo=simbolo,
-            capital=cap_ref,
-            tick_value=tick_value,
-            tick_size=tick_size,
-            point=point,
-            atr=atr,
-            atr_medio=atr_medio,
-            spread=spread,
-            margin_level=margin_level,
-            factor_volatilidad=factor_volatilidad,
-            factor_conviccion=factor_conviccion
-        )
+        sl_pips = sl_dist / pip_size if pip_size > 0 else 10
+        if sl_pips <= 0:
+            sl_pips = 10
         
-        # Ajuste por pérdidas consecutivas
-        if self.perdidas_consecutivas >= 2:
-            lotes *= 0.7
-        elif self.perdidas_consecutivas >= 1:
-            lotes *= 0.9
+        # ============================================================
+        # 4. RIESGO POR ACTIVO
+        # ============================================================
+        simbolo_upper = simbolo.upper()
+        riesgo_max_por_operacion = getattr(Umbrales, 'RIESGO_MAX_POR_OPERACION', {})
+        riesgo_pct = riesgo_max_por_operacion.get(simbolo_upper, 0.01)
         
-        return max(0.01, min(self.calculador_lotes.max_lote_absoluto, lotes))
+        # Ajuste por probabilidad
+        if probabilidad > 70:
+            riesgo_pct = min(riesgo_pct * 1.1, 0.02)
+        elif probabilidad < 40:
+            riesgo_pct = riesgo_pct * 0.7
+        
+        # Límites
+        riesgo_pct = min(riesgo_pct, 0.02)
+        riesgo_pct = max(riesgo_pct, 0.001)
+        
+        # ============================================================
+        # 5. ✅ VERIFICAR MARGEN DISPONIBLE
+        # ============================================================
+        margen_libre = self.obtener_margen_libre()
+        
+        # Calcular lotes por riesgo
+        riesgo_dinero = capital * riesgo_pct
+        tick_value = kwargs.get('tick_value', 0.01)
+        tick_size = kwargs.get('tick_size', 0.00001)
+        point = kwargs.get('point', 0.00001)
+        
+        valor_pip = self._calcular_valor_pip(simbolo, entrada, tick_value, tick_size, point, pip_size)
+        if valor_pip <= 0:
+            valor_pip = 1.0
+        
+        lotes_por_riesgo = riesgo_dinero / (sl_pips * valor_pip) if sl_pips > 0 and valor_pip > 0 else 0.01
+        
+        # ============================================================
+        # 6. LÍMITES POR ACTIVO
+        # ============================================================
+        lotes_max_por_activo = getattr(Umbrales, 'LOTES_MAX_POR_ACTIVO', {})
+        lotes_min_por_activo = getattr(Umbrales, 'LOTES_MIN_POR_ACTIVO', {})
+        
+        lote_min = lotes_min_por_activo.get(simbolo_upper, 0.01)
+        lote_max = lotes_max_por_activo.get(simbolo_upper, 0.10)
+        
+        # Límites especiales para XAUUSD
+        if 'XAU' in simbolo_upper:
+            lote_max = min(lote_max, 0.05)
+            if capital < 1000:
+                lote_max = min(lote_max, 0.02)
+            elif capital < 2000:
+                lote_max = min(lote_max, 0.03)
+        
+        # Factor por capital
+        if capital < 5000:
+            factor_capital = max(0.3, capital / 5000)
+            lote_max = max(lote_min, lote_max * factor_capital)
+        
+        # ============================================================
+        # 7. ✅ LIMITAR POR MARGEN DISPONIBLE
+        # ============================================================
+        margen_por_lote = self._estimar_margen(simbolo, 1.0, entrada)
+        
+        if margen_por_lote > 0:
+            lotes_max_por_margen = margen_libre / margen_por_lote
+            lotes_max_por_margen = round(lotes_max_por_margen / 0.01) * 0.01
+            
+            if lotes_max_por_margen < lote_min:
+                self.logger.warning(f"⚠️ {simbolo}: Margen insuficiente para lote mínimo")
+                return 0.0
+            
+            lote_max = min(lote_max, lotes_max_por_margen)
+        
+        # ============================================================
+        # 8. APLICAR LÍMITES
+        # ============================================================
+        lotes = max(lote_min, min(lote_max, lotes_por_riesgo))
+        
+        # Redondear
+        paso = 0.01
+        lotes = round(lotes / paso) * paso
+        if lotes < lote_min:
+            lotes = lote_min
+        
+        self.logger.info(f"📊 {simbolo}: Lotes={lotes:.3f} (riesgo: {riesgo_pct*100:.2f}%)")
+        self.logger.info(f"   Capital: ${capital:.2f} | Margen libre: ${margen_libre:.2f}")
+        
+        return lotes
+
+    def _obtener_pip_size(self, simbolo: str) -> float:
+        """Obtiene el tamaño del pip para el símbolo."""
+        try:
+            from utils.parametros_simbolo import get_pip_val
+            return get_pip_val(simbolo, self.mt5 if hasattr(self, 'mt5') else None)
+        except ImportError:
+            simbolo_upper = simbolo.upper()
+            if 'JPY' in simbolo_upper:
+                return 0.01
+            elif 'XAU' in simbolo_upper:
+                return 0.10  # ✅ CORREGIDO: 0.10 para oro
+            elif 'XAG' in simbolo_upper:
+                return 0.01
+            elif any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
+                return 1.0
+            elif 'BTC' in simbolo_upper:
+                return 1.0
+            elif 'ETH' in simbolo_upper:
+                return 1.0
+            elif 'SOL' in simbolo_upper:
+                return 1.0
+            else:
+                return 0.0001
+
+
+    def _calcular_valor_pip(self,
+                            simbolo: str,
+                            entrada: float,
+                            tick_value: Optional[float],
+                            tick_size: Optional[float],
+                            point: Optional[float],
+                            pip_size: float) -> float:
+        """Calcula el valor de 1 pip en la moneda de la cuenta."""
+        try:
+            simbolo_upper = simbolo.upper()
+            
+            # 1. Usar tick_value del broker si está disponible
+            if tick_value is not None and tick_size is not None and tick_value > 0 and tick_size > 0:
+                return tick_value / tick_size * pip_size
+            
+            # 2. Fallback por tipo de activo
+            if 'XAU' in simbolo_upper:
+                return 0.10  # $0.10 por pip para 0.01 lotes
+            elif 'XAG' in simbolo_upper:
+                return 1.0
+            elif 'JPY' in simbolo_upper:
+                return 1.0 / 100
+            elif any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
+                return 1.0
+            elif any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
+                return 1.0
+            else:
+                return 1.0  # Forex estándar: $1 por pip para 0.01 lotes
+                
+        except Exception as e:
+            self.logger.warning(f"⚠️ Error calculando valor pip para {simbolo}: {e}")
+            return 1.0
+
+
+    def _estimar_margen(self, simbolo: str, lotes: float, precio: float) -> float:
+        """Estima el margen requerido para una operación."""
+        simbolo_upper = simbolo.upper()
+        
+        # Apalancamiento típico
+        apalancamiento = 30
+        
+        if 'XAU' in simbolo_upper or 'XAG' in simbolo_upper:
+            apalancamiento = 20
+        elif any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
+            apalancamiento = 20
+        elif any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
+            apalancamiento = 10
+        
+        # Tamaño del contrato
+        contract_size = 100000
+        
+        if 'XAU' in simbolo_upper or 'XAG' in simbolo_upper:
+            contract_size = 100
+        elif any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
+            contract_size = 1
+        elif any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
+            contract_size = 1
+        
+        valor_operacion = lotes * contract_size * precio
+        margen = valor_operacion / apalancamiento
+        
+        return margen
     
     # ============================================================
     # REGISTRO DE OPERACIONES
@@ -409,6 +650,16 @@ class GestionRiesgo:
             f"📊 Operación registrada: {simbolo} | PnL: {ganancia_neta:+.2f} | "
             f"Capital: ${float(self.capital_actual):,.2f}"
         )
+        
+        # ✅ NUEVO V9.65: ALERTA POR PÉRDIDAS CONSECUTIVAS EN SÍMBOLO
+        if self.perdidas_consecutivas_por_simbolo.get(simbolo, 0) >= 3:
+            self.logger.warning(f"⚠️ {simbolo}: {self.perdidas_consecutivas_por_simbolo[simbolo]} pérdidas consecutivas")
+            if self.notificador:
+                self.notificador.enviar(
+                    "⚠️ ALERTA PÉRDIDAS",
+                    f"{simbolo}: {self.perdidas_consecutivas_por_simbolo[simbolo]} pérdidas consecutivas",
+                    tipo='warning'
+                )
     
     def _verificar_circuit_breaker(self):
         """Verifica condiciones de Circuit Breaker."""
@@ -486,13 +737,16 @@ class GestionRiesgo:
         Returns:
             Diccionario con estadísticas
         """
+        # ✅ Obtener capital real
+        capital_real = self.obtener_capital_real()
+        
         # Estadísticas básicas
         stats = {
-            'capital_actual': float(self.capital_actual),
+            'capital_actual': capital_real,
             'capital_inicial': float(self.capital_inicial),
             'total_aportado': float(self.total_aportado),
-            'ganancia_neta': float(self.capital_actual - self.capital_inicial),
-            'rendimiento': float((self.capital_actual / self.capital_inicial - 1) * 100),
+            'ganancia_neta': float(capital_real - float(self.capital_inicial)),
+            'rendimiento': float((capital_real / float(self.capital_inicial) - 1) * 100),
             'ganancia_diaria': float(self.ganancia_diaria),
             'perdida_diaria': float(self.perdida_diaria),
             'operaciones_hoy': self.operaciones_hoy,
@@ -500,6 +754,7 @@ class GestionRiesgo:
             'perdidas_consecutivas': self.perdidas_consecutivas,
             'etapa': self.ultima_etapa,
             'circuit_breaker': self.circuit_breaker.get_stats(),
+            'margen_libre': self.obtener_margen_libre(),
         }
         
         # Win Rate
@@ -540,7 +795,7 @@ class GestionRiesgo:
         Returns:
             Etapa (1-4)
         """
-        cap = self.capital_actual
+        cap = self.obtener_capital_real()
         if cap < 350.0:
             return 1
         elif cap < 500.0:
@@ -657,7 +912,8 @@ def create_gestion_riesgo(capital_inicial: float = 100.0,
                           almacen: Optional[Any] = None,
                           notificador: Optional[Any] = None,
                           config: Optional[Any] = None,
-                          modo_backtest: bool = False) -> GestionRiesgo:
+                          modo_backtest: bool = False,
+                          mt5: Optional[Any] = None) -> GestionRiesgo:
     """
     Crea una instancia de GestionRiesgo.
     
@@ -668,6 +924,7 @@ def create_gestion_riesgo(capital_inicial: float = 100.0,
         notificador: Sistema de notificaciones
         config: Configuración
         modo_backtest: Modo backtest
+        mt5: Conector MT5 (para capital real)
     
     Returns:
         GestionRiesgo
@@ -678,5 +935,6 @@ def create_gestion_riesgo(capital_inicial: float = 100.0,
         almacen=almacen,
         notificador=notificador,
         config=config,
-        modo_backtest=modo_backtest
+        modo_backtest=modo_backtest,
+        mt5=mt5
     )
