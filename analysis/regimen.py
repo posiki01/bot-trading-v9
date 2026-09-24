@@ -227,7 +227,10 @@ class MarketRegimeFilter:
             bb_width_pct=indicadores.get('bb_width', 50),
             atr_pct=indicadores.get('atr_pct', 0.5),
             estructura_swings=indicadores.get('estructura', 'DESCONOCIDO'),
-            direccion_favor=self._determinar_direccion_favor(indicadores),
+            direccion_favor=self._determinar_direccion_favor(
+                indicadores,
+                regimen_resultante=regimen,   # ✅ pasa el régimen ganador
+            ),
             ichimoku_tendencia=indicadores.get('ichimoku', {}).get('tendencia', 'NEUTRAL'),
             chop_index=indicadores.get('chop_index', 50),
             vix_proxy=indicadores.get('vix_proxy', 0),
@@ -502,12 +505,59 @@ class MarketRegimeFilter:
     # MÉTODOS DE UTILIDAD
     # ============================================================
     
-    def _determinar_direccion_favor(self, indicadores: Dict) -> str:
-        """Determina dirección favorita."""
+    def _determinar_direccion_favor(
+        self,
+        indicadores: Dict,
+        regimen_resultante: Optional[str] = None,
+    ) -> str:
+        """
+        Determina la dirección favorita del mercado.
+
+        V9.1 - FIX:
+        Antes usaba SOLO la estructura H1, causando contradicciones como:
+            Régimen = TREND_BAJISTA_FUERTE
+            Dirección favorita = ALCISTA  ← INCORRECTO
+        Ahora usa el RÉGIMEN como fuente principal (coherente con la votación
+        de los 10 indicadores) y la estructura como fallback.
+
+        LÓGICA:
+        1. Régimen TREND_ALCISTA_* → ALCISTA
+        2. Régimen TREND_BAJISTA_* → BAJISTA
+        3. Régimen BREAKOUT/RANGO/CHOP/INCERTO → usa estructura H1 como fallback
+        4. Sin información → NONE
+        """
+        # 1. Régimen como fuente principal
+        if regimen_resultante:
+            r = regimen_resultante.upper()
+
+            if 'TREND' in r and 'ALCISTA' in r:
+                return 'ALCISTA'
+            if 'TREND' in r and 'BAJISTA' in r:
+                return 'BAJISTA'
+
+            # Breakout: depende de estructura
+            if 'BREAKOUT' in r:
+                estructura = indicadores.get('estructura', 'DESCONOCIDO')
+                if estructura == 'ALCISTA':
+                    return 'ALCISTA'
+                if estructura == 'BAJISTA':
+                    return 'BAJISTA'
+                return 'NONE'
+
+            # Rango / CHOP / INCERTO: usar estructura si es clara
+            if any(x in r for x in ['RANGO', 'CHOP', 'INCERTO']):
+                estructura = indicadores.get('estructura', 'DESCONOCIDO')
+                if estructura == 'ALCISTA':
+                    return 'ALCISTA'
+                if estructura == 'BAJISTA':
+                    return 'BAJISTA'
+                return 'NONE'
+
+        # 2. Fallback: estructura H1 pura (comportamiento anterior)
         estructura = indicadores.get('estructura', 'DESCONOCIDO')
         if estructura == 'ALCISTA':
             return 'ALCISTA'
-        elif estructura == 'BAJISTA':
+        if estructura == 'BAJISTA':
             return 'BAJISTA'
         return 'NONE'
     

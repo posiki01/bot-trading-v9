@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-utils/helpers.py (V9.70 - CORREGIDO DEFINITIVO)
+utils/helpers.py (V9.71 - CORREGIDO DEFINITIVO)
 Utilidades generales para el bot.
+
+V9.71 - CORRECCIONES:
+- ✅ Eliminada recursión circular en get_pip_val y get_digits
+- ✅ Cálculo correcto de valor de pip para pares JPY
+- ✅ Funciones unificadas sin dependencias circulares
 """
 
 import json
@@ -346,55 +351,132 @@ def get_base_quote(simbolo: str) -> Tuple[str, str]:
 
 
 # ============================================================
-# PIP VALUE Y DIGITS POR SÍMBOLO (CORREGIDO - SIN RECURSIÓN)
+# ✅ PIP VALUE Y DIGITS POR SÍMBOLO (CORREGIDO - SIN RECURSIÓN)
 # ============================================================
+
+# ✅ MAPA DE VALORES POR TIPO DE ACTIVO (SIN RECURSIÓN)
+_PIP_VALUES = {
+    'FOREX': 0.0001,
+    'FOREX_JPY': 0.01,
+    'XAU': 0.10,
+    'XAG': 0.01,
+    'INDICES': 1.0,
+    # ✅ V9.72: pip_val cripto proporcional
+    'BTC': 1.0,
+    'ETH': 0.10,
+    'SOL': 0.01,
+    'CRIPTO_ALT': 0.01,
+}
+
+_DIGITS_MAP = {
+    'FOREX': 5,
+    'FOREX_JPY': 3,
+    'XAU': 2,
+    'XAG': 3,
+    'INDICES': 1,
+    'CRIPTO': 2,
+}
+
 
 def get_pip_val(simbolo: str, precio: float = 0.0, mt5: Optional[Any] = None) -> float:
     """
     Obtiene el valor de un pip para el símbolo.
-    V9.70 - CORREGIDO DEFINITIVO - SIN RECURSIÓN.
+    V9.72 - Pip cripto proporcional al precio típico.
     """
-    # ✅ CORREGIDO: NO importar desde parametros_simbolo (evita recursión)
     simbolo_upper = simbolo.upper()
+
     if 'JPY' in simbolo_upper:
-        return 0.01
+        return _PIP_VALUES['FOREX_JPY']
     if 'XAU' in simbolo_upper:
-        return 0.10  # ✅ CORREGIDO: 0.10 para oro
+        return _PIP_VALUES['XAU']
     if 'XAG' in simbolo_upper:
-        return 0.01
+        return _PIP_VALUES['XAG']
     if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
-        return 1.0
+        return _PIP_VALUES['INDICES']
+
+    # ✅ Cripto específico
     if 'BTC' in simbolo_upper:
-        return 1.0
+        return _PIP_VALUES['BTC']
     if 'ETH' in simbolo_upper:
-        return 1.0
+        return _PIP_VALUES['ETH']
     if 'SOL' in simbolo_upper:
-        return 1.0
-    return 0.0001  # ✅ Forex estándar
+        return _PIP_VALUES['SOL']
+    if any(c in simbolo_upper for c in ['XRP', 'ADA', 'DOT', 'LINK', 'UNI', 'MATIC']):
+        return _PIP_VALUES['CRIPTO_ALT']
+
+    return _PIP_VALUES['FOREX']
 
 
 def get_digits(simbolo: str, mt5: Optional[Any] = None) -> int:
     """
     Obtiene el número de dígitos del símbolo.
-    V9.70 - CORREGIDO DEFINITIVO - SIN RECURSIÓN.
+    V9.71 - CORREGIDO DEFINITIVO - SIN RECURSIÓN.
     """
     # ✅ CORREGIDO: NO importar desde parametros_simbolo (evita recursión)
     simbolo_upper = simbolo.upper()
+    
     if 'JPY' in simbolo_upper:
-        return 3
+        return _DIGITS_MAP['FOREX_JPY']  # 3
     if 'XAU' in simbolo_upper:
-        return 2
+        return _DIGITS_MAP['XAU']  # 2
     if 'XAG' in simbolo_upper:
-        return 3
+        return _DIGITS_MAP['XAG']  # 3
     if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
-        return 1
+        return _DIGITS_MAP['INDICES']  # 1
     if 'BTC' in simbolo_upper:
-        return 2
+        return _DIGITS_MAP['CRIPTO']  # 2
     if 'ETH' in simbolo_upper:
-        return 2
+        return _DIGITS_MAP['CRIPTO']  # 2
     if 'SOL' in simbolo_upper:
-        return 2
-    return 5  # ✅ CORREGIDO: 5 para Forex estándar
+        return _DIGITS_MAP['CRIPTO']  # 2
+    
+    return _DIGITS_MAP['FOREX']  # 5
+
+
+def get_point(simbolo: str, mt5: Optional[Any] = None) -> float:
+    """
+    Obtiene el tamaño del punto para el símbolo.
+    """
+    digits = get_digits(simbolo, mt5)
+    return 10 ** (-digits)
+
+
+def get_contract_size(simbolo: str) -> float:
+    """
+    Obtiene el tamaño del contrato para el símbolo.
+    """
+    simbolo_upper = simbolo.upper()
+    
+    if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
+        return 1.0
+    if 'XAU' in simbolo_upper:
+        return 100.0
+    if 'XAG' in simbolo_upper:
+        return 5000.0
+    if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
+        return 1.0
+    return 100000.0
+
+
+def calcular_valor_pip_usd(simbolo: str, lotes: float, precio: float = 0.0) -> float:
+    """
+    Calcula el valor REAL de 1 pip en USD para la posición.
+    V9.71 - NUEVO: Función unificada para todo el sistema.
+    """
+    simbolo_upper = simbolo.upper()
+    pip_val = get_pip_val(simbolo, precio)
+    contract_size = get_contract_size(simbolo)
+    
+    # ✅ Para pares JPY, el valor depende del precio
+    if 'JPY' in simbolo_upper:
+        if precio <= 0:
+            precio = 1.0
+        valor_1_lote = (contract_size * pip_val) / precio
+    else:
+        valor_1_lote = contract_size * pip_val
+    
+    valor_posicion = valor_1_lote * lotes
+    return max(0.001, valor_posicion)  # Garantizar mínimo
 
 
 # ============================================================
@@ -522,51 +604,6 @@ def log_debug(msg: str):
     logger.debug(msg)
 
 
-# ============================================================
-# TEST
-# ============================================================
-
-if __name__ == "__main__":
-    print("🧪 Probando módulo helpers...")
-    
-    print("\n1. Limpieza de texto:")
-    texto = "Hola 👋 Mundo 🌍!  Test  "
-    print(f"  Original: {texto}")
-    print(f"  Limpio: {limpiar_texto(texto)}")
-    print(f"  Normalizado: {normalizar_texto(texto)}")
-    
-    print("\n2. Formateo:")
-    print(f"  Dinero: {formatear_dinero(1234.56)}")
-    print(f"  Dinero negativo: {formatear_dinero(-1234.56)}")
-    print(f"  Porcentaje: {formatear_porcentaje(0.75)}")
-    print(f"  Fecha: {formatear_fecha()}")
-    
-    print("\n3. Símbolos:")
-    simbolos = ['EURUSD', 'BTCUSD', 'US30', 'XAUUSD', 'EURGBP']
-    for s in simbolos:
-        print(f"  {s}:")
-        print(f"    Forex: {es_forex(s)}")
-        print(f"    Crypto: {es_crypto(s)}")
-        print(f"    Índice: {es_indice(s)}")
-        print(f"    Metal: {es_metal(s)}")
-        print(f"    Tipo: {get_tipo_activo(s)}")
-        print(f"    Normalizado: {normalizar_simbolo(s)}")
-        print(f"    Base/Quote: {get_base_quote(s)}")
-    
-    print("\n4. Conversiones seguras:")
-    print(f"  safe_float('123.45'): {safe_float('123.45')}")
-    print(f"  safe_float(None): {safe_float(None)}")
-    print(f"  safe_int('123'): {safe_int('123')}")
-    print(f"  safe_bool('true'): {safe_bool('true')}")
-    
-    print("\n5. Normalizaciones:")
-    print(f"  normalizar_precio(1.234567, 5): {normalizar_precio(1.234567, 5)}")
-    print(f"  normalizar_lotes(0.123, 0.01): {normalizar_lotes(0.123, 0.01)}")
-    print(f"  normalizar_porcentaje(150): {normalizar_porcentaje(150)}")
-    
-    print("\n✅ Prueba completada")
-
-
 def get_mt5_path() -> Optional[str]:
     try:
         from config.settings import Config
@@ -589,3 +626,42 @@ def get_mt5_path() -> Optional[str]:
             if os.path.exists(p):
                 return p
     return None
+
+
+# ============================================================
+# TEST
+# ============================================================
+
+if __name__ == "__main__":
+    print("🧪 Probando módulo helpers V9.71...")
+    
+    # Probar get_pip_val sin recursión
+    print("\n1. get_pip_val (sin recursión):")
+    simbolos = ['EURUSD', 'USDJPY', 'XAUUSD', 'BTCUSD', 'US30', 'GBPJPY']
+    for s in simbolos:
+        pip = get_pip_val(s)
+        print(f"   {s}: pip_val = {pip}")
+    
+    # Probar get_digits
+    print("\n2. get_digits (sin recursión):")
+    for s in simbolos:
+        digits = get_digits(s)
+        print(f"   {s}: digits = {digits}")
+    
+    # Probar calcular_valor_pip_usd
+    print("\n3. calcular_valor_pip_usd (valor real):")
+    for s in simbolos:
+        if 'JPY' in s:
+            precio = 160.0 if 'USD' in s else 185.0
+        elif 'XAU' in s:
+            precio = 2000.0
+        elif 'BTC' in s:
+            precio = 50000.0
+        elif 'US30' in s:
+            precio = 40000.0
+        else:
+            precio = 1.1
+        valor = calcular_valor_pip_usd(s, 0.01, precio)
+        print(f"   {s} (0.01 lotes, precio={precio:.2f}): ${valor:.4f}/pip")
+    
+    print("\n✅ Prueba completada")

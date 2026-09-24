@@ -1,48 +1,44 @@
 #!/usr/bin/env python3
 """
-analysis/ml_optimizer.py (V9.0 - REFACTORIZADO COMPLETAMENTE)
-Motor de Machine Learning para optimización de pesos del Score Engine.
+analysis/ml/ml_optimizer.py (V2.0 - ORQUESTACIÓN LIMPIA)
+Orquestador del ciclo de vida del modelo ML.
 
-RESPONSABILIDADES:
-- Orquestar el entrenamiento del modelo ML
-- Gestionar pesos optimizados
-- Coordinar Surrogate Trading, Hard Negative Mining y drift
-- Proveer predicciones de puntuación
+RESPONSABILIDAD:
+- Recibir operaciones cerradas reales
+- Construir dataset → entrenar → validar → persistir
+- Detectar drift y forzar reentrenamiento
+- Proveer predicciones en tiempo real
 
-MEJORAS V9.0:
-- Separación de responsabilidades en submódulos
-- Logs detallados de entrenamiento
-- Integración con umbrales centralizados
-- Métricas de rendimiento del modelo
-- Caché de predicciones
-- Soporte para backtest
+NO HACE:
+- Ingeniería de features (delega a FeatureExtractor)
+- Construcción de dataset (delega a DatasetBuilder)
+- Entrenamiento (delega a EntrenadorML)
+- Predicción (delega a PredictorML)
 """
 
 import logging
-import time
-import threading
-from typing import Dict, Any, Optional, List, Tuple
-from datetime import datetime, timezone, timedelta
 from pathlib import Path
-import json
-import os
+from typing import Dict, Any, Optional, List
+from datetime import datetime, timezone, timedelta
 
-# ============================================================
-# IMPORTS REFACTORIZADOS
-# ============================================================
-
-from config.umbrales import Umbrales
-from utils.helpers import safe_float
-from utils.logger_persistente import LoggerPersistente
-
-# Submódulos (se importan dinámicamente para evitar dependencias circulares)
+from .ml_features import FeatureExtractor
+from .ml_dataset import DatasetBuilder
 from .ml_entrenamiento import EntrenadorML
-from .ml_surrogate import SurrogateTrader
-from .ml_mining import HardNegativeMiner
+from .ml_prediccion import PredictorML
 from .ml_drift import DriftDetector
 from .ml_persistencia import MLCache
 
-logger = logging.getLogger('BotTrading.MLOptimizer')
+logger = logging.getLogger('BotTrading.ML.Optimizer')
+
+
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+
+MIN_OPS_PARA_ENTRENAR = 30
+MIN_OPS_ENTRE_ENTRENAMIENTOS = 20
+DIAS_ENTRE_REENTRENOS = 7
+HORAS_COOLDOWN = 4
 
 
 # ============================================================
@@ -51,648 +47,296 @@ logger = logging.getLogger('BotTrading.MLOptimizer')
 
 class MLOptimizer:
     """
-    Optimizador de ML con ventana deslizante, ponderación temporal y aprendizaje por simulación.
-    V9.0 - REFACTORIZADO COMPLETAMENTE.
+    Orquestador del modelo ML.
+    Aprende de operaciones REALES del bot.
     """
-    
-    # ============================================================
-    # CONFIGURACIÓN
-    # ============================================================
-    
-    PESOS_DEFECTO = {
-        'w_tecnica': 0.35,
-        'w_institucional': 0.45,
-        'w_fundamental': 0.20,
-        'bias': 0.0,
-        'bias_compra': 0.0,
-        'bias_venta': 0.0,
-    }
-    
-    W_MIN_FLOOR = 0.20
-    BIAS_MAX_ABS = 15.0
-    MAX_CAMBIO_PESO_RELATIVO = 0.35
-    MUESTRAS_MINIMAS_ENTRENAMIENTO = 30
-    MAX_EDAD_OPERACIONES_DIAS = 90
-    DIAS_ENTRE_REENTRENOS_FORZADOS = 7
-    COOLDOWN_HORAS = 4
-    
-    def __init__(self,
-                 historial_ops: Optional[List[Dict]] = None,
-                 oportunidades_no_tomadas: Optional[List[Dict]] = None,
-                 almacen: Optional[Any] = None,
-                 notificador: Optional[Any] = None,
-                 score_engine_weights: Optional[Dict] = None,
-                 config: Optional[Any] = None,
-                 modo_backtest: bool = False):
-        """
-        Inicializa el optimizador ML.
-        
-        Args:
-            historial_ops: Historial de operaciones
-            oportunidades_no_tomadas: Oportunidades rechazadas
-            almacen: Almacenamiento
-            notificador: Sistema de notificaciones
-            score_engine_weights: Pesos iniciales
-            config: Configuración
-            modo_backtest: Modo backtest
-        """
-        self.config = config
-        self.modo_backtest = modo_backtest
-        self.logger = logging.getLogger('BotTrading.MLOptimizer')
-        
-        # ============================================================
-        # 1. DATOS
-        # ============================================================
-        
-        self.historial_operaciones = historial_ops or []
-        self.oportunidades_no_tomadas = oportunidades_no_tomadas or []
+
+    def __init__(
+        self,
+        almacen: Optional[Any] = None,
+        notificador: Optional[Any] = None,
+        config: Optional[Any] = None,
+        modo_backtest: bool = False,
+    ):
         self.almacen = almacen
         self.notificador = notificador
-        
-        # ============================================================
-        # 2. PESOS
-        # ============================================================
-        
-        self.pesos_optimizados = self.PESOS_DEFECTO.copy()
-        if score_engine_weights:
-            self.pesos_optimizados.update(score_engine_weights)
-        
-        # ============================================================
-        # 3. ESTADO
-        # ============================================================
-        
-        self.fecha_ultimo_reentreno: Optional[datetime] = None
-        self.ultimo_intento_reentreno: Optional[datetime] = None
-        self.esta_entrenando = False
-        self.ml_activado = True
-        
-        # ============================================================
-        # 4. MÉTRICAS
-        # ============================================================
-        
-        self.metricas_referencia: Dict = {}
-        self.historial_metricas: List[Dict] = []
-        self.historial_pesos: List[Dict] = []
-        
-        # ============================================================
-        # 5. CACHÉ Y PERSISTENCIA
-        # ============================================================
-        
-        self._cache = MLCache(almacen=almacen, base_dir=Path("data"))
-        self._cargar_estado()
-        
-        # ============================================================
-        # 6. INICIALIZAR SCORE ENGINE
-        # ============================================================
-        
-        self.score_engine = None
-        self._inicializar_score_engine()
-        
-        # ============================================================
-        # 7. SUBMÓDULOS
-        # ============================================================
-        
-        self._entrenador = EntrenadorML(
-            pesos_defecto=self.PESOS_DEFECTO,
-            w_min_floor=self.W_MIN_FLOOR,
-            bias_max_abs=self.BIAS_MAX_ABS,
-            max_cambio_peso=self.MAX_CAMBIO_PESO_RELATIVO,
-            muestras_minimas=self.MUESTRAS_MINIMAS_ENTRENAMIENTO,
-            score_engine=self.score_engine,
-            modo_backtest=self.modo_backtest
-        )
-        
-        self._surrogate = SurrogateTrader(
-            score_engine=self.score_engine,
-            modo_backtest=self.modo_backtest
-        )
-        
-        self._miner = HardNegativeMiner(
-            bias_max_abs=self.BIAS_MAX_ABS,
-            modo_backtest=self.modo_backtest
-        )
-        
-        self._drift_detector = DriftDetector(
-            metricas_referencia=self.metricas_referencia,
-            pesos_optimizados=self.pesos_optimizados,
-            score_engine=self.score_engine,
-            modo_backtest=self.modo_backtest
-        )
-        
-        self.logger.info(f"🧠 MLOptimizer V9.0 inicializado")
-        self.logger.info(f"   Backtest: {modo_backtest}")
-        self.logger.info(f"   Pesos: {self.pesos_optimizados}")
-        self.logger.info(f"   Último reentreno: {self.fecha_ultimo_reentreno}")
+        self.config = config
+        self.modo_backtest = modo_backtest
+        self.logger = logging.getLogger('BotTrading.ML.Optimizer')
 
-    # ================================================================
-    # INICIALIZACIÓN
-    # ================================================================
-    
-    def _inicializar_score_engine(self):
-        """Inicializa el ScoreEngine con los pesos actuales."""
+        # Componentes
+        self._extractor = FeatureExtractor()
+        self._dataset = DatasetBuilder(feature_extractor=self._extractor)
+        self._entrenador = EntrenadorML(modo_backtest=modo_backtest)
+        self._predictor = PredictorML()
+        self._drift = DriftDetector()
+        self._cache = MLCache(almacen=almacen, base_dir=Path("data"))
+
+        # Estado
+        self._entrenando = False
+        self._ultima_fecha_entreno: Optional[datetime] = None
+        self._ops_desde_ultimo_entreno = 0
+        self._ops_buffer: List[Dict[str, Any]] = []
+
+        # Cargar modelo guardado
+        self._cargar_modelo_inicial()
+
+        self.logger.info("🧠 MLOptimizer V2.0 inicializado")
+        self.logger.info(f"   Modo: {'BACKTEST' if modo_backtest else 'REAL'}")
+        self.logger.info(f"   Modelo cargado: {'✅' if self._predictor.tiene_modelo() else '❌'}")
+
+    # ============================================================
+    # CICLO PRINCIPAL
+    # ============================================================
+
+    def registrar_operacion_cerrada(self, operacion: Dict[str, Any]):
+        """
+        Registra una operación cerrada para futuros entrenamientos.
+        Este es el punto de entrada principal.
+        """
+        if operacion.get('estado') != 'CERRADA':
+            return
+
+        if 'ganancia_neta' not in operacion:
+            return
+
+        # Añadir al buffer
+        self._ops_buffer.append(operacion)
+        self._ops_desde_ultimo_entreno += 1
+
+        # Limitar buffer
+        if len(self._ops_buffer) > 1000:
+            self._ops_buffer = self._ops_buffer[-1000:]
+
+        # ¿Toca entrenar?
+        if self._debe_entrenar():
+            self.entrenar()
+
+    def debe_predecir(self) -> bool:
+        """Indica si el modelo está listo para predecir."""
+        return self._predictor.tiene_modelo()
+
+    def predecir_probabilidad(self, contexto: Dict[str, Any]) -> Optional[float]:
+        """
+        Predice la probabilidad de que una operación sea ganadora.
+
+        Args:
+            contexto: Dict con el contexto de la operación (mismo formato
+                      que las operaciones cerradas)
+
+        Returns:
+            float en [0, 1] o None si no hay modelo
+        """
+        if not self._predictor.tiene_modelo():
+            return None
+
+        features = self._extractor.extraer(contexto)
+        if features is None:
+            return None
+
+        return self._predictor.predecir(features)
+
+    # ============================================================
+    # ENTRENAMIENTO
+    # ============================================================
+
+    def entrenar(self, forzado: bool = False) -> bool:
+        """
+        Entrena (o reentrena) el modelo.
+        """
+        if self._entrenando:
+            self.logger.debug("⏳ Entrenamiento ya en curso")
+            return False
+
+        # Cooldown
+        if not forzado and self._ultima_fecha_entreno:
+            delta = (datetime.now(timezone.utc) - self._ultima_fecha_entreno).total_seconds() / 3600
+            if delta < HORAS_COOLDOWN:
+                self.logger.debug(f"⏳ Cooldown activo ({delta:.1f}h < {HORAS_COOLDOWN}h)")
+                return False
+
         try:
-            from analysis.scoring import ScoreEngine
-            self.score_engine = ScoreEngine(
-                config=self.config,
-                pesos=self.pesos_optimizados,
-                modo_backtest=self.modo_backtest
+            self._entrenando = True
+            self.logger.info("🧠 Iniciando entrenamiento...")
+
+            # 1. Recopilar operaciones
+            operaciones = self._recopilar_operaciones()
+            if len(operaciones) < MIN_OPS_PARA_ENTRENAR and not forzado:
+                self.logger.info(f"⚠️ Operaciones insuficientes: {len(operaciones)} < {MIN_OPS_PARA_ENTRENAR}")
+                return False
+
+            # 2. Construir dataset
+            resultado_dataset = self._dataset.construir(
+                operaciones,
+                lookback_dias=180,
+                balancear=True,
             )
-        except Exception as e:
-            self.logger.warning(f"⚠️ Error inicializando ScoreEngine: {e}")
-            self.score_engine = None
-    
-    def _cargar_estado(self):
-        """Carga estado desde almacenamiento."""
-        # Cargar pesos
-        pesos = self._cache.cargar_pesos()
-        if pesos:
-            self.pesos_optimizados = pesos
-        
-        # Cargar métricas
-        metricas = self._cache.cargar_metricas()
-        if metricas:
-            self.metricas_referencia = metricas.get('referencia', {})
-            self.historial_metricas = metricas.get('historial', [])
-            self.historial_pesos = metricas.get('historial_pesos', [])
-        
-        # Cargar metadata
-        meta = self._cache.cargar_metadata()
-        if meta:
-            if meta.get('fecha_ultimo_reentreno'):
+            if resultado_dataset is None:
+                self.logger.warning("⚠️ No se pudo construir dataset")
+                return False
+
+            X, y, nombres = resultado_dataset
+
+            # 3. Entrenar
+            resultado = self._entrenador.ejecutar(X, y, nombres, forzado=forzado)
+
+            if not resultado['exito']:
+                self.logger.warning(f"⚠️ Entrenamiento falló: {resultado.get('razon')}")
+                return False
+
+            # 4. Guardar modelo
+            modelo = resultado['modelo']
+            metricas = resultado['metricas']
+
+            self._predictor.set_modelo(modelo, self._extractor)
+            self._guardar_modelo(modelo, metricas)
+
+            self._ultima_fecha_entreno = datetime.now(timezone.utc)
+            self._ops_desde_ultimo_entreno = 0
+
+            self.logger.info(
+                f"✅ Entrenamiento completado | "
+                f"AUC={metricas['test'].get('roc_auc', 0):.3f} | "
+                f"Acc={metricas['test'].get('accuracy', 0):.3f}"
+            )
+
+            # Notificar
+            if self.notificador:
                 try:
-                    self.fecha_ultimo_reentreno = datetime.fromisoformat(meta['fecha_ultimo_reentreno'])
-                except:
+                    self.notificador.enviar(
+                        "🧠 MODELO ML ACTUALIZADO",
+                        f"n_muestras: {metricas.get('n_muestras', 0)}\n"
+                        f"AUC: {metricas['test'].get('roc_auc', 0):.3f}\n"
+                        f"Accuracy: {metricas['test'].get('accuracy', 0):.3f}\n"
+                        f"Brier: {metricas['test'].get('brier', 0):.3f}",
+                        tipo='info',
+                    )
+                except Exception:
                     pass
 
-    # ================================================================
-    # ENTRENAMIENTO PRINCIPAL
-    # ================================================================
-    
-    def entrenar_modelo(self, lookback_days: int = 90, forzado: bool = False) -> bool:
-        """
-        Entrena el modelo con operaciones reales cerradas.
-        
-        Args:
-            lookback_days: Días a mirar hacia atrás
-            forzado: Forzar entrenamiento aunque no haya datos suficientes
-        
-        Returns:
-            True si se entrenó correctamente
-        """
-        if self.modo_backtest:
-            self.logger.info("🧪 Modo backtest: saltando entrenamiento")
-            return False
-        
-        if self.esta_entrenando:
-            self.logger.debug("⏳ Entrenamiento en progreso")
-            return False
-        
-        try:
-            self.esta_entrenando = True
-            self.logger.info("🧠 Iniciando entrenamiento del modelo ML...")
-            
-            # 1. Preparar datos
-            datos = self._preparar_datos_entrenamiento(lookback_days)
-            
-            if not datos:
-                self.logger.warning("⚠️ Sin datos suficientes para entrenar")
-                self.esta_entrenando = False
-                return False
-            
-            self.logger.info(f"📊 Datos preparados: {len(datos)} registros")
-            
-            # 2. Ejecutar entrenamiento
-            resultado = self._entrenador.ejecutar(
-                datos=datos,
-                pesos_actuales=self.pesos_optimizados,
-                forzado=forzado
-            )
-            
-            if not resultado['exito']:
-                self.logger.warning(f"⚠️ Entrenamiento falló: {resultado.get('razon', 'Desconocida')}")
-                self.esta_entrenando = False
-                return False
-            
-            # 3. Actualizar pesos
-            self.pesos_optimizados = resultado['pesos']
-            self.fecha_ultimo_reentreno = datetime.now(timezone.utc)
-            
-            # 4. Actualizar métricas
-            self.metricas_referencia = {
-                'r2': resultado.get('r2_test', 0),
-                'mse': resultado.get('mse_test', 0),
-                'n_muestras': len(datos),
-                'timestamp': datetime.now(timezone.utc).isoformat(),
-            }
-            self.historial_metricas.append(self.metricas_referencia)
-            self.historial_pesos.append({
-                **self.pesos_optimizados,
-                'timestamp': self.fecha_ultimo_reentreno.isoformat(),
-                'n_muestras': len(datos),
-                'r2_test': resultado.get('r2_test', 0),
-            })
-            
-            # 5. Persistir
-            self._cache.guardar_pesos(self.pesos_optimizados)
-            self._cache.guardar_metricas({
-                'referencia': self.metricas_referencia,
-                'historial': self.historial_metricas,
-                'historial_pesos': self.historial_pesos,
-            })
-            self._cache.guardar_metadata({
-                'fecha_ultimo_reentreno': self.fecha_ultimo_reentreno.isoformat(),
-            })
-            
-            # 6. Actualizar ScoreEngine
-            if self.score_engine:
-                self.score_engine.weights = self.pesos_optimizados
-            
-            self.logger.info(f"✅ Modelo entrenado exitosamente (R2: {resultado.get('r2_test', 0):.4f})")
-            self.logger.info(f"   Pesos: {self.pesos_optimizados}")
-            
-            self.esta_entrenando = False
             return True
-            
+
         except Exception as e:
             self.logger.error(f"❌ Error en entrenamiento: {e}", exc_info=True)
-            self.esta_entrenando = False
             return False
-    
-    def _preparar_datos_entrenamiento(self, lookback_days: int) -> List[Dict]:
-        """Prepara datos para entrenamiento."""
-        datos = []
-        
-        # 1. Operaciones cerradas
-        for op in self.historial_operaciones:
-            if op.get('estado') == 'CERRADA':
-                datos.append(op.copy())
-        
-        # 2. Oportunidades no tomadas (con outcome evaluado)
-        for op in self.oportunidades_no_tomadas:
-            if op.get('evaluado_outcome'):
-                op_c = op.copy()
-                if 'timestamp' not in op_c and 'timestamp_propuesta' in op_c:
-                    op_c['timestamp'] = op_c['timestamp_propuesta']
-                datos.append(op_c)
-        
-        if not datos:
-            return []
-        
-        # Filtrar por antigüedad
-        ahora = datetime.now(timezone.utc)
-        fecha_corte = ahora - timedelta(days=lookback_days)
-        
-        datos_filtrados = []
-        for op in datos:
-            try:
-                ts_str = op.get('timestamp', '2000-01-01T00:00:00')
-                ts = datetime.fromisoformat(ts_str)
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                
-                if ts > fecha_corte:
-                    datos_filtrados.append(op)
-            except Exception:
-                continue
-        
-        # Ordenar por fecha
-        datos_filtrados.sort(
-            key=lambda x: datetime.fromisoformat(x.get('timestamp', '2000-01-01T00:00:00'))
-        )
-        
-        return datos_filtrados
-    
-    # ================================================================
-    # SURROGATE TRADING
-    # ================================================================
-    
-    def entrenar_con_simulaciones(self, mt5_connector: Any, simbolos: List[str],
-                                  velas_back: int = 300) -> bool:
-        """
-        Entrena el modelo con simulaciones de trading en velas históricas.
-        
-        Args:
-            mt5_connector: Conector MT5
-            simbolos: Lista de símbolos
-            velas_back: Número de velas a analizar
-        
-        Returns:
-            True si se entrenó correctamente
-        """
-        if self.modo_backtest:
-            self.logger.info("🧪 Modo backtest: saltando surrogate trading")
+        finally:
+            self._entrenando = False
+
+    # ============================================================
+    # DRIFT
+    # ============================================================
+
+    def evaluar_drift(self) -> bool:
+        """Evalúa drift y reentrena si aplica."""
+        if not self._predictor.tiene_modelo():
             return False
-        
-        if not mt5_connector:
-            self.logger.warning("⚠️ Sin conector MT5, no se puede hacer Surrogate Trading")
+
+        operaciones = self._recopilar_operaciones()
+        if len(operaciones) < 20:
             return False
-        
-        if self.esta_entrenando:
-            self.logger.debug("⏳ Entrenamiento en progreso")
-            return False
-        
-        try:
-            self.logger.info(f"🧠 Iniciando Surrogate Trading en {len(simbolos)} símbolos...")
-            
-            simulaciones = self._surrogate.generar_simulaciones(
-                mt5_connector=mt5_connector,
-                simbolos=simbolos,
-                velas_back=velas_back
-            )
-            
-            if not simulaciones or len(simulaciones) < 50:
-                self.logger.warning(f"⚠️ Solo {len(simulaciones) if simulaciones else 0} simulaciones. Necesarias 50.")
-                return False
-            
-            self.logger.info(f"🧠 Generadas {len(simulaciones)} operaciones simuladas")
-            
-            # Entrenar con simulaciones
-            return self.entrenar_modelo_con_datos(simulaciones, forzado=True)
-            
-        except Exception as e:
-            self.logger.error(f"❌ Error en Surrogate Trading: {e}", exc_info=True)
-            return False
-    
-    def entrenar_modelo_con_datos(self, datos: List[Dict], forzado: bool = False) -> bool:
-        """Entrena el modelo con datos proporcionados."""
-        if self.esta_entrenando:
-            return False
-        
-        try:
-            self.esta_entrenando = True
-            
-            resultado = self._entrenador.ejecutar(
-                datos=datos,
-                pesos_actuales=self.pesos_optimizados,
-                forzado=forzado
-            )
-            
-            if not resultado['exito']:
-                self.esta_entrenando = False
-                return False
-            
-            self.pesos_optimizados = resultado['pesos']
-            self.fecha_ultimo_reentreno = datetime.now(timezone.utc)
-            
-            self._cache.guardar_pesos(self.pesos_optimizados)
-            self._cache.guardar_metadata({
-                'fecha_ultimo_reentreno': self.fecha_ultimo_reentreno.isoformat(),
-            })
-            
-            if self.score_engine:
-                self.score_engine.weights = self.pesos_optimizados
-            
-            self.esta_entrenando = False
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"❌ Error entrenando con datos: {e}", exc_info=True)
-            self.esta_entrenando = False
-            return False
-    
-    # ================================================================
-    # HARD NEGATIVE MINING
-    # ================================================================
-    
-    def entrenar_con_rechazos(self) -> bool:
-        """
-        Analiza las oportunidades rechazadas y ajusta el bias del modelo.
-        
-        Returns:
-            True si se ajustó correctamente
-        """
-        if not self.oportunidades_no_tomadas:
-            return False
-        
-        resultado = self._miner.ejecutar(
-            oportunidades=self.oportunidades_no_tomadas,
-            pesos_actuales=self.pesos_optimizados
-        )
-        
-        if resultado['ajustado']:
-            self.pesos_optimizados = resultado['pesos']
-            self._cache.guardar_pesos(self.pesos_optimizados)
-            
-            if self.score_engine:
-                self.score_engine.weights = self.pesos_optimizados
-            
-            self.logger.info(f"🧠 Hard Negative Mining: bias ajustado +{resultado['ajuste']:.2f}")
-            return True
-        
+
+        hay_drift = self._drift.detectar(operaciones, self._predictor)
+
+        if hay_drift:
+            self.logger.info("🌊 Drift detectado, reentrenando...")
+            return self.entrenar(forzado=True)
+
         return False
-    
-    # ================================================================
-    # EVALUACIÓN DE DRIFT
-    # ================================================================
-    
-    def evaluar_drift(self, mt5_connector: Optional[Any] = None,
-                      simbolos: Optional[List[str]] = None) -> bool:
-        """
-        Evalúa drift y fuerza reentrenamiento.
-        
-        Args:
-            mt5_connector: Conector MT5
-            simbolos: Lista de símbolos
-        
-        Returns:
-            True si se reentrenó
-        """
-        if self.modo_backtest:
-            return False
-        
-        ahora = datetime.now(timezone.utc)
-        
-        # Cooldown
-        if self.ultimo_intento_reentreno:
-            if (ahora - self.ultimo_intento_reentreno).total_seconds() < self.COOLDOWN_HORAS * 3600:
-                self.logger.debug(f"⏳ Reentrenamiento en cooldown ({self.COOLDOWN_HORAS}h)")
-                return False
-        
-        # 1. Reentreno forzado por tiempo
-        if self.fecha_ultimo_reentreno:
-            dias_transcurridos = (ahora - self.fecha_ultimo_reentreno).days
-        else:
-            dias_transcurridos = 999
-        
-        if dias_transcurridos >= self.DIAS_ENTRE_REENTRENOS_FORZADOS:
-            self.logger.info(f"🧠 Reentrenamiento forzado por tiempo ({dias_transcurridos} días)")
-            self.ultimo_intento_reentreno = ahora
-            
-            if mt5_connector and simbolos:
-                if self.entrenar_con_simulaciones(mt5_connector, simbolos):
-                    return True
-            
-            return self.entrenar_modelo(forzado=True)
-        
-        # 2. Evaluar drift por métricas
-        if self.metricas_referencia and self.historial_operaciones:
-            # Actualizar detector con últimos datos
-            self._drift_detector.actualizar_metricas(self.metricas_referencia)
-            
-            drift_detectado = self._drift_detector.detectar(
-                operaciones=self.historial_operaciones,
-                pesos_actuales=self.pesos_optimizados
-            )
-            
-            if drift_detectado:
-                self.logger.info("🧠 Drift detectado, reentrenando...")
-                self.ultimo_intento_reentreno = ahora
-                
-                if mt5_connector and simbolos:
-                    if self.entrenar_con_simulaciones(mt5_connector, simbolos):
-                        return True
-                
-                return self.entrenar_modelo(forzado=True)
-        
-        # 3. Hard Negative Mining (cada 12 horas)
-        if not hasattr(self, '_ultimo_rechazo_mining'):
-            self._ultimo_rechazo_mining = None
-        
-        if self._ultimo_rechazo_mining is None or \
-           (ahora - self._ultimo_rechazo_mining).total_seconds() > 12 * 3600:
-            self.entrenar_con_rechazos()
-            self._ultimo_rechazo_mining = ahora
-        
-        return False
-    
-    # ================================================================
-    # PREDICCIÓN
-    # ================================================================
-    
-    def predecir_puntuacion(self, analisis_raw: Dict, sentimiento_noticias: float,
-                            reporte_cot: float, sniper_confirmado: bool = False,
-                            regimen: Optional[str] = None,
-                            fase: Optional[int] = None) -> float:
-        """
-        Predice la puntuación usando el ScoreEngine.
-        
-        Args:
-            analisis_raw: Análisis crudo
-            sentimiento_noticias: Sentimiento de noticias
-            reporte_cot: Reporte COT
-            sniper_confirmado: Sniper confirmado
-            regimen: Régimen
-            fase: Fase
-        
-        Returns:
-            Puntuación predicha
-        """
-        try:
-            if self.score_engine is None:
-                return 50.0
-            
-            # Extraer régimen y fase
-            if regimen is None:
-                regimen = analisis_raw.get('regimen', 'UNCERTAIN')
-            if fase is None:
-                fase = analisis_raw.get('fase', 1)
-            
-            # Calcular score
-            score = self.score_engine.calcular_puntuacion_maestra(
-                analisis_raw=analisis_raw,
-                sentimiento_noticias=sentimiento_noticias,
-                reporte_cot=reporte_cot,
-                sniper_confirmado=sniper_confirmado,
-                regimen=regimen,
-                fase=fase
-            )
-            
-            return float(score) if score is not None else 50.0
-            
-        except Exception as e:
-            self.logger.error(f"❌ Error en predicción ML: {e}")
-            return 50.0
-    
-    # ================================================================
+
+    # ============================================================
     # UTILIDADES
-    # ================================================================
-    
-    def obtener_pesos_optimizados(self) -> Dict[str, float]:
-        """Obtiene los pesos optimizados actuales."""
-        return self.pesos_optimizados.copy()
-    
-    def reset_modelo(self) -> bool:
-        """Reinicia el modelo a valores de fábrica."""
-        try:
-            self.pesos_optimizados = self.PESOS_DEFECTO.copy()
-            self.historial_metricas = []
-            self.historial_pesos = []
-            self.metricas_referencia = {}
-            self.fecha_ultimo_reentreno = datetime.now(timezone.utc) - timedelta(days=self.DIAS_ENTRE_REENTRENOS_FORZADOS)
-            
-            if self.score_engine:
-                self.score_engine.weights = self.pesos_optimizados
-            
-            self._cache.guardar_pesos(self.pesos_optimizados)
-            self._cache.guardar_metadata({
-                'fecha_ultimo_reentreno': self.fecha_ultimo_reentreno.isoformat(),
-            })
-            self.ml_activado = True
-            
-            self.logger.info("🧠 Modelo ML reiniciado a valores de fábrica")
-            
-            if self.notificador:
-                self.notificador.enviar("🧠 ML RESET", "Modelo reiniciado a valores de fábrica", tipo='info')
-            
+    # ============================================================
+
+    def _debe_entrenar(self) -> bool:
+        """Determina si es momento de entrenar."""
+        # Primera vez
+        if self._ultima_fecha_entreno is None:
+            return self._ops_desde_ultimo_entreno >= MIN_OPS_PARA_ENTRENAR
+
+        # Por tiempo
+        dias = (datetime.now(timezone.utc) - self._ultima_fecha_entreno).days
+        if dias >= DIAS_ENTRE_REENTRENOS:
             return True
+
+        # Por volumen
+        if self._ops_desde_ultimo_entreno >= MIN_OPS_ENTRE_ENTRENAMIENTOS:
+            return True
+
+        return False
+
+    def _recopilar_operaciones(self) -> List[Dict[str, Any]]:
+        """Recopila operaciones cerradas del almacén + buffer."""
+        ops = list(self._ops_buffer)
+
+        if self.almacen:
+            try:
+                almacenadas = self.almacen.obtener_operaciones({
+                    'estado': 'CERRADA',
+                    'limite': 1000,
+                    'orden': 'ASC',
+                })
+                # Deduplicar por ticket
+                tickets_vistos = set()
+                combinadas = []
+                for op in ops + almacenadas:
+                    ticket = op.get('ticket')
+                    if ticket and ticket in tickets_vistos:
+                        continue
+                    if ticket:
+                        tickets_vistos.add(ticket)
+                    combinadas.append(op)
+                return combinadas
+            except Exception as e:
+                self.logger.debug(f"⚠️ Error leyendo almacén: {e}")
+
+        return ops
+
+    def _cargar_modelo_inicial(self):
+        """Intenta cargar modelo guardado."""
+        try:
+            modelo_data = self._cache.cargar_modelo()
+            if modelo_data:
+                self._predictor.cargar_modelo(modelo_data, self._extractor)
+                self._ultima_fecha_entreno = modelo_data.get('fecha')
+                self.logger.info(f"📂 Modelo cargado (entrenado: {self._ultima_fecha_entreno})")
         except Exception as e:
-            self.logger.error(f"❌ Error reiniciando modelo: {e}")
-            return False
-    
-    def get_metricas(self) -> Dict[str, Any]:
-        """Obtiene métricas del modelo."""
+            self.logger.debug(f"⚠️ No se pudo cargar modelo: {e}")
+
+    def _guardar_modelo(self, modelo, metricas: Dict):
+        """Persiste el modelo."""
+        try:
+            self._cache.guardar_modelo(modelo, metricas, self._extractor.nombres_features())
+        except Exception as e:
+            self.logger.warning(f"⚠️ Error guardando modelo: {e}")
+
+    # ============================================================
+    # INFO
+    # ============================================================
+
+    def get_info(self) -> Dict[str, Any]:
         return {
-            'pesos_actuales': self.pesos_optimizados,
-            'fecha_ultimo_reentreno': self.fecha_ultimo_reentreno.isoformat() if self.fecha_ultimo_reentreno else None,
-            'metricas_referencia': self.metricas_referencia,
-            'historial_metricas': self.historial_metricas[-10:],
-            'total_entrenamientos': len(self.historial_metricas),
-            'ml_activado': self.ml_activado,
-            'modo_backtest': self.modo_backtest,
+            'tiene_modelo': self._predictor.tiene_modelo(),
+            'ultima_fecha_entreno': self._ultima_fecha_entreno.isoformat() if self._ultima_fecha_entreno else None,
+            'ops_desde_ultimo_entreno': self._ops_desde_ultimo_entreno,
+            'metricas': self._entrenador.obtener_metricas(),
+            'ops_en_buffer': len(self._ops_buffer),
         }
-    
-    def set_modo_backtest(self, modo: bool = True):
-        """Activa modo backtest."""
-        self.modo_backtest = modo
-        self._entrenador.modo_backtest = modo
-        self._surrogate.modo_backtest = modo
-        self._miner.modo_backtest = modo
-        self._drift_detector.modo_backtest = modo
-        self.logger.info(f"🔧 Modo backtest: {'ACTIVADO' if modo else 'DESACTIVADO'}")
 
 
 # ============================================================
-# FUNCIÓN DE UTILIDAD
+# FACTORY
 # ============================================================
 
-def create_ml_optimizer(historial_ops: Optional[List[Dict]] = None,
-                        oportunidades_no_tomadas: Optional[List[Dict]] = None,
-                        almacen: Optional[Any] = None,
-                        notificador: Optional[Any] = None,
-                        score_engine_weights: Optional[Dict] = None,
-                        config: Optional[Any] = None,
-                        modo_backtest: bool = False) -> MLOptimizer:
-    """
-    Crea una instancia de MLOptimizer.
-    
-    Args:
-        historial_ops: Historial de operaciones
-        oportunidades_no_tomadas: Oportunidades rechazadas
-        almacen: Almacenamiento
-        notificador: Sistema de notificaciones
-        score_engine_weights: Pesos iniciales
-        config: Configuración
-        modo_backtest: Modo backtest
-    
-    Returns:
-        MLOptimizer
-    """
+def create_ml_optimizer(
+    almacen: Optional[Any] = None,
+    notificador: Optional[Any] = None,
+    config: Optional[Any] = None,
+    modo_backtest: bool = False,
+    **kwargs,
+) -> MLOptimizer:
     return MLOptimizer(
-        historial_ops=historial_ops,
-        oportunidades_no_tomadas=oportunidades_no_tomadas,
         almacen=almacen,
         notificador=notificador,
-        score_engine_weights=score_engine_weights,
         config=config,
-        modo_backtest=modo_backtest
+        modo_backtest=modo_backtest,
     )

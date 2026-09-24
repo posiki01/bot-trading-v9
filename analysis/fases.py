@@ -58,7 +58,7 @@ class AnalisisPorFase:
         self.logger = logging.getLogger('BotTrading.Fases')
         
         self.analisis_capas = analisis_capas
-        self.regimen_filter = MarketRegimeFilter(config=config)
+        self.regimen_filter = MarketRegimeFilter(config=config, modo_backtest=modo_backtest)
         
         self.umbral_fase_3 = 25 if modo_backtest else 40
         

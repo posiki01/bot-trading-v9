@@ -1,207 +1,325 @@
 #!/usr/bin/env python3
-"""Entrenamiento del modelo ML con Ridge regression."""
+"""
+analysis/ml/ml_entrenamiento.py (V2.0 - APRENDIZAJE REAL)
+Entrenamiento del modelo ML con Gradient Boosting + Walk-Forward.
+
+DIFERENCIAS VS V1.0:
+- ❌ Antes: Ridge regression sobre 5 features de un score que no refleja la decisión
+- ✅ Ahora: Gradient Boosting sobre features RICAS del contexto real
+- ❌ Antes: Entrenaba un modelo que predecía un score ficticio
+- ✅ Ahora: Predice P(ganadora) directamente
+- ❌ Antes: Sin validación temporal
+- ✅ Ahora: Walk-forward con TimeSeriesSplit
+
+MODELO:
+- HistGradientBoostingClassifier (rápido, robusto, buena con poco dato)
+- Calibración con IsotonicRegression
+- Umbral de decisión ajustable
+"""
 
 import logging
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import Ridge
+from typing import Dict, Any, Optional, Tuple, List
+from datetime import datetime, timezone
+
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import mean_squared_error, r2_score
-from typing import Dict, Any, List, Optional
+from sklearn.metrics import (
+    roc_auc_score, accuracy_score, precision_score, recall_score, f1_score,
+    brier_score_loss, log_loss,
+)
 
 logger = logging.getLogger('BotTrading.ML.Entrenamiento')
 
 
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+
+MIN_MUESTRAS_HARD = 30            # Por debajo, no entrenar nunca
+MIN_MUESTRAS_OPTIMO = 100         # A partir de aquí, umbrales más exigentes
+MIN_ROC_AUC = 0.52                # Mínimo para considerar el modelo útil
+MIN_ACCURACY = 0.52
+MAX_BRIER = 0.28                  # Brier score máximo (0=perfecto, 0.25=random)
+
+# Pesos de muestra (operaciones recientes pesan más)
+DECAY_FACTOR = 0.995              # Factor de decaimiento por operación
+
+
+# ============================================================
+# ENTRENADOR
+# ============================================================
+
 class EntrenadorML:
-    """Entrenador del modelo ML con Ridge regression."""
-    
-    def __init__(self, pesos_defecto: Dict, w_min_floor: float = 0.20,
-                 bias_max_abs: float = 15.0, max_cambio_peso: float = 0.35,
-                 muestras_minimas: int = 30, score_engine: Optional[Any] = None,
-                 modo_backtest: bool = False):
-        self.pesos_defecto = pesos_defecto
-        self.w_min_floor = w_min_floor
-        self.bias_max_abs = bias_max_abs
-        self.max_cambio_peso = max_cambio_peso
-        self.muestras_minimas = muestras_minimas
-        self.score_engine = score_engine
+    """
+    Entrenador con Gradient Boosting + validación walk-forward.
+    """
+
+    def __init__(
+        self,
+        modo_backtest: bool = False,
+        calibrar: bool = True,
+        random_state: int = 42,
+    ):
         self.modo_backtest = modo_backtest
+        self.calibrar = calibrar
+        self.random_state = random_state
         self.logger = logging.getLogger('BotTrading.ML.Entrenamiento')
-    
-    def ejecutar(self, datos: List[Dict], pesos_actuales: Dict[str, float],
-                 forzado: bool = False) -> Dict[str, Any]:
-        """Ejecuta el entrenamiento."""
-        if len(datos) < self.muestras_minimas and not forzado:
-            return {'exito': False, 'razon': f"Datos insuficientes ({len(datos)})"}
-        
-        features = self._preparar_features(datos)
-        if features is None or len(features) < 5:
-            return {'exito': False, 'razon': "Features insuficientes"}
-        
-        try:
-            resultado = self._entrenar_modelo(features, forzado)
-        except Exception as e:
-            self.logger.error(f"Error entrenando: {e}")
-            return {'exito': False, 'razon': f"Error: {e}"}
-        
-        if not resultado['exito']:
-            return resultado
-        
-        nuevos_pesos = self._actualizar_pesos(resultado, pesos_actuales)
-        
+
+        self._ultimo_modelo = None
+        self._ultimas_metricas: Dict[str, Any] = {}
+
+    # ============================================================
+    # API PÚBLICA
+    # ============================================================
+
+    def ejecutar(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        nombres_features: Optional[List[str]] = None,
+        forzado: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Entrena el modelo con validación walk-forward.
+
+        Args:
+            X: Features (n_muestras, n_features)
+            y: Labels (0=perdedora, 1=ganadora)
+            nombres_features: Para logging
+            forzado: Entrenar aunque no cumpla umbrales
+
+        Returns:
+            Dict con:
+                'exito': bool
+                'modelo': modelo entrenado (o None)
+                'metricas': dict con AUC, accuracy, brier, etc.
+                'razon': motivo de fallo (si exito=False)
+        """
+        # 1. Validaciones
+        if X is None or y is None or len(X) == 0:
+            return self._fallo("Sin datos")
+
+        if len(X) != len(y):
+            return self._fallo(f"X y Y desalineados: {len(X)} vs {len(y)}")
+
+        n_muestras = len(X)
+        n_pos = int(np.sum(y == 1))
+        n_neg = int(np.sum(y == 0))
+
+        if n_pos == 0 or n_neg == 0:
+            return self._fallo(f"Una clase vacía: pos={n_pos}, neg={n_neg}")
+
+        min_req = MIN_MUESTRAS_HARD if not forzado else 20
+        if n_muestras < min_req:
+            return self._fallo(f"Muestras insuficientes: {n_muestras} < {min_req}")
+
+        self.logger.info(
+            f"🧠 Entrenando modelo: n={n_muestras} (pos={n_pos}, neg={n_neg})"
+        )
+
+        # 2. Split temporal (último 20% para test)
+        split_idx = max(int(n_muestras * 0.8), n_muestras - 20)
+        X_train, X_test = X[:split_idx], X[split_idx:]
+        y_train, y_test = y[:split_idx], y[split_idx:]
+
+        if len(X_test) < 5:
+            X_test = X[-min(10, n_muestras):]
+            y_test = y[-min(10, n_muestras):]
+            X_train = X[:-len(X_test)]
+            y_train = y[:-len(y_test)]
+
+        # 3. Walk-forward cross-validation
+        metricas_cv = self._walk_forward(X_train, y_train)
+
+        # 4. Entrenar modelo final
+        modelo = self._entrenar_modelo(X_train, y_train)
+
+        if modelo is None:
+            return self._fallo("Error entrenando modelo base")
+
+        # 5. Calibrar si aplica
+        if self.calibrar and len(X_train) >= 50:
+            modelo = self._calibrar_modelo(modelo, X_train, y_train)
+
+        # 6. Evaluar en test
+        metricas_test = self._evaluar(modelo, X_test, y_test)
+
+        # 7. Verificar umbrales de calidad
+        cumple_umbrales = (
+            metricas_test.get('roc_auc', 0) >= MIN_ROC_AUC and
+            metricas_test.get('accuracy', 0) >= MIN_ACCURACY and
+            metricas_test.get('brier', 1.0) <= MAX_BRIER
+        )
+
+        if not cumple_umbrales and not forzado:
+            return self._fallo(
+                f"Modelo no cumple umbrales: "
+                f"AUC={metricas_test.get('roc_auc', 0):.3f} "
+                f"Acc={metricas_test.get('accuracy', 0):.3f} "
+                f"Brier={metricas_test.get('brier', 1):.3f}"
+            )
+
+        # 8. Guardar modelo
+        self._ultimo_modelo = modelo
+        self._ultimas_metricas = {
+            'train': metricas_cv,
+            'test': metricas_test,
+            'n_muestras': n_muestras,
+            'n_pos': n_pos,
+            'n_neg': n_neg,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+        }
+
+        self.logger.info(
+            f"✅ Modelo entrenado | "
+            f"AUC={metricas_test.get('roc_auc', 0):.3f} "
+            f"Acc={metricas_test.get('accuracy', 0):.3f} "
+            f"Brier={metricas_test.get('brier', 1):.3f}"
+        )
+
         return {
             'exito': True,
-            'pesos': nuevos_pesos,
-            'r2_test': resultado.get('r2_test', 0),
-            'mse_test': resultado.get('mse_test', 0),
-            'n_muestras': len(features),
+            'modelo': modelo,
+            'metricas': self._ultimas_metricas,
+            'n_features': X.shape[1],
+            'n_muestras': n_muestras,
         }
-    
-    def _preparar_features(self, datos: List[Dict]) -> Optional[pd.DataFrame]:
-        """Prepara features para entrenamiento."""
-        features = []
-        for op in datos:
-            try:
-                pts_est = float(op.get('pts_estructura', 50))
-                pts_mom = float(op.get('pts_momentum', 50))
-                pts_conf = float(op.get('pts_confluencia', 50))
-                pts_inst = float(op.get('pts_institucional', 50))
-                
-                direccion = op.get('direccion', 'COMPRA')
-                is_buy = 1 if direccion in ['COMPRA', 'BUY'] else 0
-                is_sell = 1 if direccion in ['VENTA', 'SELL'] else 0
-                
-                ganancia = float(op.get('ganancia_neta', 0))
-                mod_noticias = float(op.get('modificador_noticias', 0)) / 20.0
-                sent_cot = float(op.get('sent_cot', 0))
-                
-                features.append({
-                    'pts_estructura': pts_est,
-                    'pts_momentum': pts_mom,
-                    'pts_confluencia': pts_conf,
-                    'pts_institucional': pts_inst,
-                    'is_buy': is_buy,
-                    'is_sell': is_sell,
-                    'mod_noticias': mod_noticias,
-                    'sent_cot': sent_cot,
-                    'ganancia_neta': ganancia,
-                })
-            except Exception:
-                continue
-        
-        if not features:
-            return None
-        
-        df = pd.DataFrame(features)
-        
-        # Calcular capas
-        df['capa_tecnica'] = (df['pts_estructura'] * 0.35 + 
-                              df['pts_momentum'] * 0.30 + 
-                              df['pts_confluencia'] * 0.20 + 
-                              df['pts_institucional'] * 0.15)
-        df['capa_institucional'] = df['pts_institucional']
-        df['capa_fundamental'] = 50.0 + (df['mod_noticias'] * 25.0) + (df['sent_cot'] * 25.0)
-        df['capa_fundamental'] = df['capa_fundamental'].clip(0, 100)
-        df['ganancia_ajustada'] = df['ganancia_neta'].apply(lambda x: x if x >= 0 else x * 2.0)
-        
-        return df
-    
-    def _entrenar_modelo(self, df: pd.DataFrame, forzado: bool) -> Dict:
-        """Entrena el modelo Ridge."""
-        features = ['capa_tecnica', 'capa_institucional', 'capa_fundamental', 'is_buy', 'is_sell']
-        X = df[features]
-        y = df['ganancia_ajustada']
-        
-        if len(X) < 5:
-            return {'exito': False, 'razon': "Datos insuficientes"}
-        
-        train_size = max(3, int(len(X) * 0.8))
-        X_train, X_test = X.iloc[:train_size], X.iloc[train_size:]
-        y_train, y_test = y.iloc[:train_size], y.iloc[train_size:]
-        
-        # Ponderación exponencial
-        n = len(X_train)
-        sample_weights = np.array([0.99 ** (n - i) for i in range(n)])
-        sample_weights = sample_weights / sample_weights.sum() * n
-        
-        # Selección de alpha
-        alphas = [0.01, 0.1, 1.0, 10.0, 100.0, 500.0]
-        best_alpha = alphas[0]
-        best_score = -float('inf')
-        
+
+    def obtener_ultimo_modelo(self):
+        return self._ultimo_modelo
+
+    def obtener_metricas(self) -> Dict[str, Any]:
+        return self._ultimas_metricas.copy()
+
+    # ============================================================
+    # WALK-FORWARD
+    # ============================================================
+
+    def _walk_forward(self, X: np.ndarray, y: np.ndarray) -> Dict[str, Any]:
+        """Evaluación walk-forward con TimeSeriesSplit."""
         try:
-            n_splits = min(3, max(2, len(X_train) - 1))
+            n_splits = min(5, max(2, len(X) // 20))
             tscv = TimeSeriesSplit(n_splits=n_splits)
-            for alpha in alphas:
-                fold_scores = []
-                for train_idx, val_idx in tscv.split(X_train):
-                    X_t, X_v = X_train.iloc[train_idx], X_train.iloc[val_idx]
-                    y_t, y_v = y_train.iloc[train_idx], y_train.iloc[val_idx]
-                    w_t = sample_weights[train_idx]
-                    try:
-                        model = Ridge(alpha=alpha)
-                        model.fit(X_t, y_t, sample_weight=w_t)
-                        y_pred = model.predict(X_v)
-                        fold_scores.append(r2_score(y_v, y_pred))
-                    except Exception:
-                        fold_scores.append(0.0)
-                mean_score = float(np.mean(fold_scores)) if fold_scores else 0.0
-                if mean_score > best_score:
-                    best_score = mean_score
-                    best_alpha = alpha
-        except Exception:
-            pass
-        
-        # Entrenar modelo final
-        model = Ridge(alpha=best_alpha)
+
+            aucs = []
+            accs = []
+            briers = []
+
+            for train_idx, val_idx in tscv.split(X):
+                X_t, X_v = X[train_idx], X[val_idx]
+                y_t, y_v = y[train_idx], y[val_idx]
+
+                if len(np.unique(y_t)) < 2 or len(np.unique(y_v)) < 2:
+                    continue
+
+                try:
+                    modelo = self._entrenar_modelo(X_t, y_t)
+                    if modelo is None:
+                        continue
+
+                    probs = modelo.predict_proba(X_v)[:, 1]
+                    preds = (probs >= 0.5).astype(int)
+
+                    aucs.append(roc_auc_score(y_v, probs))
+                    accs.append(accuracy_score(y_v, preds))
+                    briers.append(brier_score_loss(y_v, probs))
+                except Exception as e:
+                    self.logger.debug(f"Fold falló: {e}")
+                    continue
+
+            return {
+                'auc_mean': float(np.mean(aucs)) if aucs else 0.5,
+                'auc_std': float(np.std(aucs)) if aucs else 0.0,
+                'acc_mean': float(np.mean(accs)) if accs else 0.5,
+                'brier_mean': float(np.mean(briers)) if briers else 0.25,
+                'n_folds': len(aucs),
+            }
+        except Exception as e:
+            self.logger.warning(f"⚠️ Error en walk-forward: {e}")
+            return {'auc_mean': 0.5, 'acc_mean': 0.5, 'n_folds': 0}
+
+    # ============================================================
+    # ENTRENAMIENTO
+    # ============================================================
+
+    def _entrenar_modelo(self, X: np.ndarray, y: np.ndarray):
+        """Entrena HistGradientBoosting."""
         try:
-            model.fit(X_train, y_train, sample_weight=sample_weights)
-        except Exception:
-            try:
-                model.fit(X_train, y_train)
-            except Exception as e:
-                return {'exito': False, 'razon': f"Error en fit: {e}"}
-        
-        # Validación
-        y_pred_test = model.predict(X_test)
-        r2_test = float(r2_score(y_test, y_pred_test)) if len(y_test) > 0 else -1.0
-        
-        if r2_test < 0.05 and not forzado:
-            return {'exito': False, 'razon': f"R2 insuficiente: {r2_test:.4f}", 'r2_test': r2_test}
-        
+            modelo = HistGradientBoostingClassifier(
+                max_iter=200,
+                max_depth=4,
+                learning_rate=0.05,
+                min_samples_leaf=5,
+                l2_regularization=1.0,
+                early_stopping=True,
+                validation_fraction=0.15,
+                n_iter_no_change=20,
+                random_state=self.random_state,
+            )
+            # Pesos por antigüedad (más reciente = más peso)
+            n = len(X)
+            sample_weight = np.array([DECAY_FACTOR ** (n - i) for i in range(n)])
+            sample_weight = sample_weight / sample_weight.sum() * n
+
+            modelo.fit(X, y, sample_weight=sample_weight)
+            return modelo
+        except Exception as e:
+            self.logger.error(f"❌ Error entrenando: {e}")
+            return None
+
+    def _calibrar_modelo(self, modelo, X: np.ndarray, y: np.ndarray):
+        """Calibra probabilidades con Isotonic."""
+        try:
+            calibrado = CalibratedClassifierCV(
+                modelo,
+                method='isotonic',
+                cv=3,
+            )
+            calibrado.fit(X, y)
+            return calibrado
+        except Exception as e:
+            self.logger.debug(f"⚠️ Calibración falló, usando modelo base: {e}")
+            return modelo
+
+    # ============================================================
+    # EVALUACIÓN
+    # ============================================================
+
+    def _evaluar(self, modelo, X: np.ndarray, y: np.ndarray) -> Dict[str, float]:
+        """Evalúa el modelo en test."""
+        try:
+            probs = modelo.predict_proba(X)[:, 1]
+            preds = (probs >= 0.5).astype(int)
+
+            metricas = {
+                'roc_auc': float(roc_auc_score(y, probs)) if len(np.unique(y)) > 1 else 0.5,
+                'accuracy': float(accuracy_score(y, preds)),
+                'precision': float(precision_score(y, preds, zero_division=0)),
+                'recall': float(recall_score(y, preds, zero_division=0)),
+                'f1': float(f1_score(y, preds, zero_division=0)),
+                'brier': float(brier_score_loss(y, probs)),
+                'log_loss': float(log_loss(y, probs)),
+                'mean_prob_pos': float(np.mean(probs[y == 1])) if np.sum(y == 1) > 0 else 0.0,
+                'mean_prob_neg': float(np.mean(probs[y == 0])) if np.sum(y == 0) > 0 else 0.0,
+                'n_test': int(len(y)),
+            }
+            return metricas
+        except Exception as e:
+            self.logger.warning(f"⚠️ Error evaluando: {e}")
+            return {'roc_auc': 0.5, 'accuracy': 0.5, 'brier': 0.25}
+
+    # ============================================================
+    # HELPERS
+    # ============================================================
+
+    def _fallo(self, razon: str) -> Dict[str, Any]:
+        self.logger.info(f"⚠️ Entrenamiento fallido: {razon}")
         return {
-            'exito': True,
-            'modelo': model,
-            'r2_train': best_score,
-            'r2_test': r2_test,
-            'mse_test': float(mean_squared_error(y_test, y_pred_test)) if len(y_test) > 0 else 0,
-            'coefs': model.coef_,
-            'intercept': model.intercept_,
-            'alpha': best_alpha,
+            'exito': False,
+            'modelo': None,
+            'razon': razon,
+            'metricas': {},
         }
-    
-    def _actualizar_pesos(self, resultado: Dict, pesos_actuales: Dict) -> Dict:
-        """Actualiza pesos con amortiguación."""
-        coefs = resultado['coefs']
-        
-        nuevos_pesos = self.pesos_defecto.copy()
-        nuevos_pesos['w_tecnica'] = max(self.w_min_floor, float(coefs[0]))
-        nuevos_pesos['w_institucional'] = max(self.w_min_floor, float(coefs[1]))
-        nuevos_pesos['w_fundamental'] = max(self.w_min_floor, float(coefs[2]))
-        nuevos_pesos['bias_compra'] = np.clip(float(coefs[3]), -self.bias_max_abs, self.bias_max_abs)
-        nuevos_pesos['bias_venta'] = np.clip(float(coefs[4]), -self.bias_max_abs, self.bias_max_abs)
-        nuevos_pesos['bias'] = np.clip(float(resultado['intercept']), -self.bias_max_abs, self.bias_max_abs)
-        
-        # Amortiguación
-        pesos_amortiguados = {}
-        for clave, valor_nuevo in nuevos_pesos.items():
-            valor_anterior = float(pesos_actuales.get(clave, valor_nuevo))
-            if valor_anterior == 0.0:
-                pesos_amortiguados[clave] = valor_nuevo
-                continue
-            cambio_max = abs(valor_anterior) * self.max_cambio_peso
-            limite_inf = valor_anterior - cambio_max
-            limite_sup = valor_anterior + cambio_max
-            pesos_amortiguados[clave] = float(np.clip(valor_nuevo, limite_inf, limite_sup))
-        
-        return pesos_amortiguados

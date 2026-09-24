@@ -1,22 +1,27 @@
-# backtesting/__init__.py - VERSIÓN SIMPLIFICADA
-
 #!/usr/bin/env python3
-"""Módulo de backtesting - Simulación y análisis de estrategias."""
+"""Módulo de backtesting del bot."""
 
-# Importar solo lo que existe
-from .backtesting_engine_v2 import BacktesterV2
-
-# Si create_backtester no existe, crearlo aquí
-def create_backtester(config, simbolos, capital_inicial=300.0, **kwargs):
-    """Crea una instancia del backtester."""
-    return BacktesterV2(
-        config=config,
-        simbolos=simbolos,
-        capital_inicial=capital_inicial,
-        **kwargs
-    )
-
+# Importaciones diferidas (los módulos se crean en bloques posteriores)
 __all__ = [
-    'BacktesterV2',
-    'create_backtester',
+    'BacktesterV10',
+    'ConectorSimulado',
+    'MetricasBacktest',
+    'Telemetria',
 ]
+
+
+def __getattr__(name):
+    """Importación perezosa."""
+    if name == 'BacktesterV10':
+        from .backtester_v10 import BacktesterV10
+        return BacktesterV10
+    if name == 'ConectorSimulado':
+        from .conector_simulado import ConectorSimulado
+        return ConectorSimulado
+    if name == 'MetricasBacktest':
+        from .metricas import MetricasBacktest
+        return MetricasBacktest
+    if name == 'Telemetria':
+        from .telemetria import Telemetria
+        return Telemetria
+    raise AttributeError(f"module 'backtesting' has no attribute '{name}'")

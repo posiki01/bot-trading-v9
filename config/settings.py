@@ -267,7 +267,8 @@ class Config:
         'EURJPY': 15, 'GBPJPY': 18,
         'XAUUSD': 60, 'XAGUSD': 80,
         'US30': 40, 'NAS100': 45, 'US500': 35,
-        'BTCUSD': 80, 'ETHUSD': 60,
+        # ✅ Cripto actualizado
+        'BTCUSD': 800, 'ETHUSD': 250,
     }
     
     # ============================================================

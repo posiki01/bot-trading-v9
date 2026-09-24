@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-trading/stops.py (V9.21 - CORREGIDO DEFINITIVO)
+trading/stops.py (V9.22 - CORREGIDO DEFINITIVO)
 Gestor de Stop Loss y Take Profit con R:R dinámico.
 
-V9.21 - CORRECCIONES DEFINITIVAS:
-- ✅ SL mínimo absoluto de 5 pips (evita cierres instantáneos)
-- ✅ TP mínimo de 1.2x SL (asegura R:R válido)
+V9.22 - CORRECCIONES:
+- ✅ Cálculo correcto de valor de pip para pares JPY
+- ✅ Validación de SL/TP considerando spread real
+- ✅ SL mínimo dinámico por tipo de activo
+- ✅ TP mínimo garantizado (1.2x SL + spread)
 - ✅ Validación de SL invertido con ajuste automático
-- ✅ Validación de TP invertido con ajuste automático
-- ✅ Distancias mínimas SL-Entry y TP-Entry
-- ✅ Método público validar_sl_tp() que llama a _validar_sl_tp()
-- ✅ TP calculado basado en R:R objetivo cuando tp=0
 """
 
 import logging
@@ -18,7 +16,6 @@ from typing import Dict, Any, Optional, Tuple, Union
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-# Importar umbrales centralizados
 try:
     from config.umbrales import Umbrales
 except ImportError:
@@ -26,10 +23,6 @@ except ImportError:
 
 logger = logging.getLogger('BotTrading.Stops')
 
-
-# ============================================================
-# DATACLASSES
-# ============================================================
 
 @dataclass
 class StopResultado:
@@ -45,14 +38,10 @@ class StopResultado:
     ajustes_aplicados: Dict[str, Any] = field(default_factory=dict)
 
 
-# ============================================================
-# CLASE PRINCIPAL
-# ============================================================
-
 class GestorStops:
     """
     Gestor de Stop Loss y Take Profit con R:R dinámico.
-    V9.21 - CORREGIDO DEFINITIVO.
+    V9.22 - CORREGIDO DEFINITIVO.
     """
 
     # ============================================================
@@ -72,16 +61,28 @@ class GestorStops:
         'SNIPER_ELITE': {'min': 1.5, 'target': 2.0, 'max': 4.0},
     }
 
-    # SL mínimo por activo (pips)
+    # SL mínimo por activo (pips) - CORREGIDO para cuentas pequeñas
     SL_MIN_POR_ACTIVO = {
-        'EURUSD': 15, 'GBPUSD': 18, 'USDJPY': 15,
-        'AUDUSD': 15, 'USDCAD': 15, 'USDCHF': 15,
-        'EURGBP': 15, 'EURJPY': 20, 'GBPJPY': 25,
-        'AUDJPY': 20, 'EURNZD': 25, 'GBPAUD': 25,
-        'EURCHF': 18, 'GBPCHF': 20,
-        'XAUUSD': 80, 'XAGUSD': 100,
-        'US30': 45, 'NAS100': 50, 'US500': 40,
-        'BTCUSD': 100, 'ETHUSD': 80, 'SOLUSD': 60,
+        # Forex
+        'EURUSD': 10, 'GBPUSD': 10, 'USDJPY': 15,
+        'AUDUSD': 10, 'USDCAD': 10, 'USDCHF': 10,
+        'EURGBP': 10, 'EURJPY': 15, 'GBPJPY': 18,
+        'AUDJPY': 15, 'EURNZD': 20, 'GBPAUD': 20,
+        'EURCHF': 12, 'GBPCHF': 15,
+
+        # Metales
+        'XAUUSD': 50, 'XAGUSD': 50,
+
+        # Índices
+        'US30': 30, 'NAS100': 30, 'US500': 25,
+
+        # ✅ Cripto (V1.1: ajustados al nuevo pip_val)
+        # Antes: BTC=100 pips ($100) → Ahora: 800 pips ($800) = 0.95% del precio
+        'BTCUSD': 800,
+        # Antes: ETH=80 pips ($80) → Ahora: 250 pips ($25) = 0.93% del precio
+        'ETHUSD': 250,
+        # Antes: SOL=60 pips ($60) → Ahora: 200 pips ($2) = 2% del precio
+        'SOLUSD': 200,
     }
 
     # SL máximo por activo (pips)
@@ -100,30 +101,25 @@ class GestorStops:
         'PESIMA': 1.3,
     }
 
-    # ✅ NUEVO: Mínimo absoluto de SL en pips
+    # ✅ Mínimos absolutos
     SL_MINIMO_ABSOLUTO_PIPS = 5
-
-    # ✅ NUEVO: Factor mínimo de TP (1.2x SL)
     TP_FACTOR_MINIMO = 1.2
 
     def __init__(self,
                  config: Optional[Any] = None,
-                 modo_backtest: bool = False):
+                 modo_backtest: bool = False,
+                 mt5: Optional[Any] = None):
         """
         Inicializa el gestor de stops.
-
-        Args:
-            config: Configuración
-            modo_backtest: Modo backtest
         """
         self.config = config
         self.modo_backtest = modo_backtest
+        self.mt5 = mt5
         self.logger = logging.getLogger('BotTrading.Stops')
 
-        # Cargar configuración
         self._cargar_configuracion()
 
-        self.logger.info(f"🛡️ GestorStops V9.21 CORREGIDO DEFINITIVO inicializado")
+        self.logger.info(f"🛡️ GestorStops V9.22 CORREGIDO inicializado")
         self.logger.info(f"   Backtest: {modo_backtest}")
         self.logger.info(f"   SL mínimo absoluto: {self.SL_MINIMO_ABSOLUTO_PIPS} pips")
         self.logger.info(f"   TP factor mínimo: {self.TP_FACTOR_MINIMO}x")
@@ -131,7 +127,6 @@ class GestorStops:
     def _cargar_configuracion(self):
         """Carga configuración desde umbrales centralizados."""
         if Umbrales is not None:
-            # R:R desde umbrales
             if hasattr(Umbrales, 'RR'):
                 rr_config = Umbrales.RR
                 for modo in self.RR_POR_MODO:
@@ -139,21 +134,18 @@ class GestorStops:
                     if rr_key in rr_config:
                         self.RR_POR_MODO[modo]['target'] = rr_config[rr_key]
 
-            # SL desde umbrales
             if hasattr(Umbrales, 'SL'):
                 sl_config = Umbrales.SL
                 for activo in self.SL_MIN_POR_ACTIVO:
                     if activo in sl_config.get('sl_min_por_activo', {}):
                         self.SL_MIN_POR_ACTIVO[activo] = sl_config['sl_min_por_activo'][activo]
 
-        # Cargar desde config
         if self.config:
             if hasattr(self.config, 'SL_MIN_PIPS_POR_ACTIVO'):
                 self.SL_MIN_POR_ACTIVO.update(getattr(self.config, 'SL_MIN_PIPS_POR_ACTIVO', {}))
             if hasattr(self.config, 'SL_MAX_PIPS_POR_ACTIVO'):
                 self.SL_MAX_POR_ACTIVO.update(getattr(self.config, 'SL_MAX_PIPS_POR_ACTIVO', {}))
 
-        # Ajustes para backtest
         if self.modo_backtest:
             for activo in self.SL_MIN_POR_ACTIVO:
                 self.SL_MIN_POR_ACTIVO[activo] = max(5, self.SL_MIN_POR_ACTIVO[activo] - 3)
@@ -162,52 +154,138 @@ class GestorStops:
                 self.RR_POR_MODO[modo]['target'] = max(0.8, self.RR_POR_MODO[modo]['target'] - 0.3)
 
     # ============================================================
-    # MÉTODOS DE AJUSTE DE SL (V9.21 - CORREGIDO)
+    # ✅ OBTENER PRECIO ACTUAL (NUEVO)
+    # ============================================================
+
+    def _obtener_precio_actual(self, simbolo: str) -> float:
+        """Obtiene el precio actual del símbolo."""
+        if self.mt5 and hasattr(self.mt5, 'obtener_precio'):
+            try:
+                tick = self.mt5.obtener_precio(simbolo)
+                if tick:
+                    return float(tick.get('bid', tick.get('ask', 0)))
+            except Exception:
+                pass
+        return 1.0
+
+    # ============================================================
+    # ✅ OBTENER VALOR DE PIP (CORREGIDO)
+    # ============================================================
+
+    def _obtener_pip_val(self, simbolo: str, precio: float = 0.0) -> float:
+        """Obtiene el valor de un pip para el símbolo."""
+        # ✅ 1. Usar módulo unificado (SIEMPRE PRIMERO)
+        try:
+            from utils.parametros_simbolo import get_pip_val
+            return get_pip_val(simbolo, self.mt5)
+        except (ImportError, RecursionError):
+            pass
+
+        # ✅ 2. Fallback CORRECTO
+        simbolo_upper = simbolo.upper()
+        if 'JPY' in simbolo_upper:
+            return 0.01
+        if 'XAU' in simbolo_upper:
+            return 0.10
+        if 'XAG' in simbolo_upper:
+            return 0.01
+        if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
+            return 1.0
+        if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
+            return 1.0
+        return 0.0001
+
+    def _obtener_digits(self, simbolo: str) -> int:
+        """Obtiene el número de decimales para el símbolo."""
+        try:
+            from utils.parametros_simbolo import get_digits
+            return get_digits(simbolo, self.mt5)
+        except (ImportError, RecursionError):
+            pass
+
+        simbolo_upper = simbolo.upper()
+        if 'JPY' in simbolo_upper:
+            return 3
+        if 'XAU' in simbolo_upper:
+            return 2
+        if 'XAG' in simbolo_upper:
+            return 3
+        if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
+            return 1
+        if 'BTC' in simbolo_upper:
+            return 2
+        if 'ETH' in simbolo_upper:
+            return 2
+        if 'SOL' in simbolo_upper:
+            return 2
+        return 5
+
+    # ============================================================
+    # ✅ OBTENER SPREAD ACTUAL (NUEVO)
+    # ============================================================
+
+    def _obtener_spread_pips(self, simbolo: str) -> float:
+        """Obtiene el spread actual en pips."""
+        if self.modo_backtest or not self.mt5:
+            return 0.0
+
+        try:
+            tick = self.mt5.obtener_precio(simbolo)
+            if tick:
+                bid = float(tick.get('bid', 0))
+                ask = float(tick.get('ask', 0))
+                if bid > 0 and ask > 0:
+                    pip_val = self._obtener_pip_val(simbolo)
+                    return (ask - bid) / pip_val if pip_val > 0 else 0
+        except Exception:
+            pass
+        return 0.0
+
+    # ============================================================
+    # MÉTODOS DE AJUSTE DE SL (CORREGIDO)
     # ============================================================
 
     def _ajustar_sl(self,
-                entry_price: float,
-                sl: float,
-                direccion: str,
-                sl_min: float,
-                sl_max: float,
-                pip_val: float,
-                digits: int) -> Tuple[float, float, str]:
+                    entry_price: float,
+                    sl: float,
+                    direccion: str,
+                    sl_min: float,
+                    sl_max: float,
+                    pip_val: float,
+                    digits: int,
+                    spread_pips: float = 0.0) -> Tuple[float, float, str]:
         """
         Ajusta el SL según mínimos y máximos.
-        V9.21 - CORREGIDO: Maneja SL invertido y mínimo absoluto.
+        V9.22 - CORREGIDO: Considera spread.
         """
         sl_dist_pips = abs(entry_price - sl) / pip_val if pip_val > 0 else 0
-        
-        # ✅ CORRECCIÓN: Validar SL invertido primero
+
+        # ✅ SL mínimo con spread
+        sl_min_efectivo = sl_min + spread_pips
+
         if direccion == 'COMPRA':
             if sl >= entry_price:
-                # SL invertido - ajustar a mínimo
-                sl = entry_price - (sl_min * pip_val)
-                sl_dist_pips = sl_min
-                razon = f"SL invertido, ajustado a mínimo ({sl_min:.1f}pips)"
-            elif sl_dist_pips < sl_min:
-                # SL muy cerca - ajustar a mínimo
-                sl = entry_price - (sl_min * pip_val)
-                sl_dist_pips = sl_min
-                razon = f"SL ajustado a mínimo ({sl_min:.1f}pips)"
+                sl = entry_price - (sl_min_efectivo * pip_val)
+                sl_dist_pips = sl_min_efectivo
+                razon = f"SL invertido, ajustado a mínimo ({sl_min_efectivo:.1f}pips)"
+            elif sl_dist_pips < sl_min_efectivo:
+                sl = entry_price - (sl_min_efectivo * pip_val)
+                sl_dist_pips = sl_min_efectivo
+                razon = f"SL ajustado a mínimo ({sl_min_efectivo:.1f}pips)"
             else:
                 razon = "OK"
         else:
             if sl <= entry_price:
-                # SL invertido - ajustar a mínimo
-                sl = entry_price + (sl_min * pip_val)
-                sl_dist_pips = sl_min
-                razon = f"SL invertido, ajustado a mínimo ({sl_min:.1f}pips)"
-            elif sl_dist_pips < sl_min:
-                # SL muy cerca - ajustar a mínimo
-                sl = entry_price + (sl_min * pip_val)
-                sl_dist_pips = sl_min
-                razon = f"SL ajustado a mínimo ({sl_min:.1f}pips)"
+                sl = entry_price + (sl_min_efectivo * pip_val)
+                sl_dist_pips = sl_min_efectivo
+                razon = f"SL invertido, ajustado a mínimo ({sl_min_efectivo:.1f}pips)"
+            elif sl_dist_pips < sl_min_efectivo:
+                sl = entry_price + (sl_min_efectivo * pip_val)
+                sl_dist_pips = sl_min_efectivo
+                razon = f"SL ajustado a mínimo ({sl_min_efectivo:.1f}pips)"
             else:
                 razon = "OK"
 
-        # ✅ CORRECCIÓN: Aplicar SL máximo SIEMPRE
         if sl_dist_pips > sl_max:
             if direccion == 'COMPRA':
                 sl = entry_price - (sl_max * pip_val)
@@ -216,7 +294,6 @@ class GestorStops:
             sl_dist_pips = sl_max
             razon = f"SL ajustado a máximo ({sl_max:.1f}pips)"
 
-        # ✅ CORRECCIÓN: Asegurar mínimo absoluto
         if sl_dist_pips < self.SL_MINIMO_ABSOLUTO_PIPS:
             if direccion == 'COMPRA':
                 sl = entry_price - (self.SL_MINIMO_ABSOLUTO_PIPS * pip_val)
@@ -225,30 +302,30 @@ class GestorStops:
             sl_dist_pips = self.SL_MINIMO_ABSOLUTO_PIPS
             razon = f"SL ajustado a mínimo absoluto ({self.SL_MINIMO_ABSOLUTO_PIPS} pips)"
 
-        # Redondear
         sl = round(sl, digits)
-
         return sl, sl_dist_pips, razon
 
     # ============================================================
-    # MÉTODOS DE AJUSTE DE TP (V9.21 - CORREGIDO)
+    # MÉTODOS DE AJUSTE DE TP (CORREGIDO)
     # ============================================================
 
     def _ajustar_tp(self,
-                entry_price: float,
-                tp: float,
-                direccion: str,
-                sl_dist: float,
-                rr_target: float,
-                rr_min: float,
-                rr_max: float,
-                pip_val: float,
-                digits: int) -> Tuple[float, float, str]:
+                    entry_price: float,
+                    tp: float,
+                    direccion: str,
+                    sl_dist: float,
+                    rr_target: float,
+                    rr_min: float,
+                    rr_max: float,
+                    pip_val: float,
+                    digits: int,
+                    spread_pips: float = 0.0) -> Tuple[float, float, str]:
         """
         Ajusta el TP según R:R.
-        V9.21 - CORREGIDO: TP mínimo garantizado.
+        V9.22 - CORREGIDO: TP mínimo con spread.
         """
-        # ✅ CORREGIDO: Si TP=0, calcular TP basado en R:R objetivo
+        sl_dist_pips = sl_dist / pip_val if pip_val > 0 else 0
+
         if tp <= 0:
             if direccion == 'COMPRA':
                 tp = entry_price + (sl_dist * rr_target)
@@ -256,30 +333,24 @@ class GestorStops:
                 tp = entry_price - (sl_dist * rr_target)
             rr_actual = rr_target
             razon = f"TP calculado por R:R ({rr_target:.2f})"
-            
-            # ✅ CORREGIDO: Asegurar TP mínimo
+
             tp_dist_pips = abs(tp - entry_price) / pip_val if pip_val > 0 else 0
-            min_tp_pips = sl_dist / pip_val * self.TP_FACTOR_MINIMO if pip_val > 0 else 0
+            min_tp_pips = sl_dist_pips * self.TP_FACTOR_MINIMO + spread_pips
             if tp_dist_pips < min_tp_pips:
                 if direccion == 'COMPRA':
                     tp = entry_price + (min_tp_pips * pip_val)
                 else:
                     tp = entry_price - (min_tp_pips * pip_val)
                 razon = f"TP ajustado a mínimo ({min_tp_pips:.1f}pips)"
-            
+
             return round(tp, digits), rr_actual, razon
-        
-        # Calcular R:R actual
+
         tp_dist = abs(tp - entry_price)
         rr_actual = tp_dist / sl_dist if sl_dist > 0 else 0
-        
-        # ✅ CORREGIDO: Validar TP mínimo
         tp_dist_pips = abs(tp - entry_price) / pip_val if pip_val > 0 else 0
-        sl_dist_pips = sl_dist / pip_val if pip_val > 0 else 0
-        min_tp_pips = sl_dist_pips * self.TP_FACTOR_MINIMO
+        min_tp_pips = sl_dist_pips * self.TP_FACTOR_MINIMO + spread_pips
 
         if tp_dist_pips < min_tp_pips:
-            # TP demasiado cerca - ajustar
             if direccion == 'COMPRA':
                 tp = entry_price + (min_tp_pips * pip_val)
             else:
@@ -287,13 +358,11 @@ class GestorStops:
             rr_actual = min_tp_pips / sl_dist_pips if sl_dist_pips > 0 else 0
             razon = f"TP ajustado a mínimo ({min_tp_pips:.1f}pips)"
             return round(tp, digits), rr_actual, razon
-        
-        # ✅ CORREGIDO: Si TP es válido (R:R >= mínimo), mantener
+
         if rr_actual >= rr_min:
             razon = "OK (TP mantiene R:R válido)"
             return round(tp, digits), rr_actual, razon
-        
-        # ✅ CORREGIDO: Si R:R es bajo, ajustar TP a mínimo
+
         if rr_actual < rr_min:
             if direccion == 'COMPRA':
                 tp = entry_price + (sl_dist * max(rr_min, self.TP_FACTOR_MINIMO))
@@ -302,46 +371,35 @@ class GestorStops:
             rr_actual = rr_min
             razon = f"TP ajustado a R:R mínimo ({rr_min:.2f})"
             return round(tp, digits), rr_actual, razon
-        
-        # Redondear
-        tp = round(tp, digits)
-        
-        return tp, rr_actual, razon
 
-    def _ajustar_tp2(self,
-                     entry_price: float,
-                     tp2: float,
-                     tp_final: float,
-                     direccion: str,
-                     sl_dist: float,
-                     digits: int) -> float:
-        """Ajusta el TP2."""
-        if tp2 <= 0:
-            return 0.0
-
-        # TP2 debe estar más lejos que TP1
-        tp_dist_final = abs(tp_final - entry_price)
-        tp2_dist_min = tp_dist_final + (sl_dist * 0.3)
-
-        if direccion == 'COMPRA':
-            tp2_ajustado = entry_price + max(tp2_dist_min, abs(tp2 - entry_price))
-        else:
-            tp2_ajustado = entry_price - max(tp2_dist_min, abs(entry_price - tp2))
-
-        return round(tp2_ajustado, digits)
+        return round(tp, digits), rr_actual, razon
 
     # ============================================================
-    # VALIDACIONES FINALES (V9.21 - CORREGIDO)
+    # VALIDACIONES FINALES (CORREGIDO)
     # ============================================================
 
     def _validar_final(self,
-                       entry_price: float,
-                       sl: float,
-                       tp: float,
-                       direccion: str,
-                       digits: int) -> Tuple[bool, str]:
-        """Validaciones finales de SL/TP."""
-        # Validar dirección del SL
+                   entry_price: float,
+                   sl: float,
+                   tp: float,
+                   direccion: str,
+                   digits: int,
+                   spread_pips: float = 0.0,
+                   simbolo: str = 'EURUSD') -> Tuple[bool, str]:
+        """
+        Validaciones finales de SL/TP.
+        V10.0 - FIX CRÍTICO: usa pip_val del símbolo real, no de EURUSD hardcoded.
+
+        Antes: pip_val = self._obtener_pip_val('EURUSD') → JPY 100x mal, XAU 1000x mal
+        Ahora: pip_val = self._obtener_pip_val(simbolo)
+        """
+        pip_val = self._obtener_pip_val(simbolo, entry_price)
+        if pip_val <= 0:
+            pip_val = 0.0001
+
+        sl_dist_pips = abs(entry_price - sl) / pip_val
+        tp_dist_pips = abs(tp - entry_price) / pip_val
+
         if direccion == 'COMPRA':
             if sl >= entry_price:
                 return False, "SL inválido: SL >= precio de entrada"
@@ -357,89 +415,53 @@ class GestorStops:
             if tp >= sl:
                 return False, "TP inválido: TP >= SL"
 
-        # ✅ CORRECCIÓN: Validar distancia mínima SL-Entry (5 pips)
-        pip_val = 0.0001
-        sl_dist = abs(entry_price - sl)
-        sl_dist_pips = sl_dist / pip_val if pip_val > 0 else 0
+        min_sl_efectivo = self.SL_MINIMO_ABSOLUTO_PIPS + spread_pips
+        if sl_dist_pips < min_sl_efectivo:
+            return False, f"SL demasiado cerca ({sl_dist_pips:.1f} pips < {min_sl_efectivo:.1f})"
 
-        if sl_dist_pips < self.SL_MINIMO_ABSOLUTO_PIPS:
-            return False, f"SL demasiado cerca ({sl_dist_pips:.1f} pips < {self.SL_MINIMO_ABSOLUTO_PIPS})"
-
-        # ✅ CORRECCIÓN: Validar distancia mínima TP-Entry (1.2x SL)
-        tp_dist = abs(tp - entry_price)
-        tp_dist_pips = tp_dist / pip_val if pip_val > 0 else 0
-
-        min_tp_pips = sl_dist_pips * self.TP_FACTOR_MINIMO
+        min_tp_pips = sl_dist_pips * self.TP_FACTOR_MINIMO + spread_pips
         if tp_dist_pips < min_tp_pips:
             return False, f"TP demasiado cerca ({tp_dist_pips:.1f} pips < {min_tp_pips:.1f})"
 
         return True, "OK"
 
     # ============================================================
-    # OBTENCIÓN DE PARÁMETROS
+    # OBTENCIÓN DE PARÁMETROS (CORREGIDO)
     # ============================================================
 
-    def _obtener_sl_minimo(self,
-                       simbolo: str,
-                       modo: str,
-                       regimen: str,
-                       calidad_horario: str,
-                       atr_pips: float = 0) -> float:
-        """Obtiene el SL mínimo en pips."""
-        # ✅ CORREGIDO: Usar valores mínimos correctos
-        sl_min_base = {
-            'EURUSD': 10,
-            'GBPUSD': 10,
-            'USDJPY': 10,
-            'AUDUSD': 10,
-            'USDCAD': 10,
-            'USDCHF': 10,
-            'EURGBP': 10,
-            'EURJPY': 15,
-            'GBPJPY': 18,
-            'XAUUSD': 50,
-            'XAGUSD': 50,
-            'US30': 30,
-            'NAS100': 30,
-            'US500': 25,
-            'BTCUSD': 100,
-            'ETHUSD': 80,
-            'SOLUSD': 60,
-        }
-        
-        sl_min = sl_min_base.get(simbolo, 10)
-        
-        # Ajuste por modo
+    def _obtener_sl_minimo(self, simbolo, modo, regimen, calidad_horario, atr_pips=0) -> float:
+        """
+        SL mínimo en pips.
+        V10.0: si el símbolo no está en el dict, usa SL_MIN_POR_ACTIVO o SL_MIN_POR_ACTIVO_UNIVERSAL.
+        """
+        # Lookup en dict de clase
+        sl_min = self.SL_MIN_POR_ACTIVO.get(simbolo)
+
+        # Fallback: usar la lógica universal si existe
+        if sl_min is None:
+            try:
+                sl_min = self._obtener_sl_minimo_universal(simbolo, modo)
+            except AttributeError:
+                sl_min = 10
+
+        # Ajustes por modo
         ajustes_modo = {
-            'RETEST': 1.0,
-            'BREAKOUT': 1.2,
-            'PULLBACK': 1.1,
-            'NIVEL_FUERTE': 0.9,
-            'SNIPER_ELITE': 1.0,
-            'PATRON': 1.0,
-            'RUPTURA_FALSA': 1.0,
-            'VELA_BORDE': 0.9,
-            'RETEST_FALLBACK': 1.1,
+            'RETEST': 1.0, 'BREAKOUT': 1.2, 'PULLBACK': 1.1,
+            'NIVEL_FUERTE': 0.9, 'SNIPER_ELITE': 1.0, 'PATRON': 1.0,
+            'RUPTURA_FALSA': 1.0, 'VELA_BORDE': 0.9, 'RETEST_FALLBACK': 1.1,
         }
         sl_min = sl_min * ajustes_modo.get(modo, 1.0)
-        
-        # Ajuste por régimen
-        ajustes_regimen = {
-            'TREND_ALCISTA_FUERTE': 1.2,
-            'TREND_BAJISTA_FUERTE': 1.2,
-            'TREND_ALCISTA_DEBIL': 1.0,
-            'TREND_BAJISTA_DEBIL': 1.0,
-            'RANGO_AMPLIO': 0.9,
-            'RANGO_APRETADO': 0.8,
-            'CHOP_VOLATIL': 1.1,
-            'BREAKOUT_INMINENTE': 1.0,
-            'INCERTO': 1.0,
+
+        # Régimen
+        ajustes_reg = {
+            'TREND_ALCISTA_FUERTE': 1.2, 'TREND_BAJISTA_FUERTE': 1.2,
+            'TREND_ALCISTA_DEBIL': 1.0, 'TREND_BAJISTA_DEBIL': 1.0,
+            'RANGO_AMPLIO': 0.9, 'RANGO_APRETADO': 0.8,
+            'CHOP_VOLATIL': 1.1, 'BREAKOUT_INMINENTE': 1.0, 'INCERTO': 1.0,
         }
-        sl_min = sl_min * ajustes_regimen.get(regimen, 1.0)
-        
-        # ✅ CORREGIDO: Asegurar mínimo absoluto de 10 pips
+        sl_min = sl_min * ajustes_reg.get(regimen, 1.0)
+
         sl_min = max(self.SL_MINIMO_ABSOLUTO_PIPS, sl_min)
-        
         return round(sl_min, 1)
 
     def _obtener_sl_maximo(self,
@@ -449,7 +471,6 @@ class GestorStops:
         """Obtiene el SL máximo en pips."""
         sl_max = self.SL_MAX_POR_ACTIVO.get(simbolo, 200)
 
-        # Ajuste por régimen
         ajustes_regimen = {
             'TREND_ALCISTA_FUERTE': 0.8,
             'TREND_BAJISTA_FUERTE': 0.8,
@@ -479,7 +500,6 @@ class GestorStops:
             'SNIPER_ELITE': 2.0,
         }.get(modo, 1.5)
 
-        # Ajuste por régimen
         ajustes_regimen = {
             'TREND_ALCISTA_FUERTE': 1.1,
             'TREND_BAJISTA_FUERTE': 1.1,
@@ -493,15 +513,12 @@ class GestorStops:
         }
         rr = rr * ajustes_regimen.get(regimen, 1.0)
 
-        # Ajuste por reversal
         if es_reversal:
             rr = rr * 0.85
 
-        # Ajuste por nivel clave
         if en_nivel_clave:
             rr = rr * 1.1
 
-        # Ajuste por calidad de horario
         rr = rr / {
             'EXCELENTE': 0.9,
             'BUENA': 1.0,
@@ -529,7 +546,6 @@ class GestorStops:
             'SNIPER_ELITE': 1.5,
         }.get(modo, 1.2)
 
-        # Ajuste por régimen
         ajustes_regimen = {
             'TREND_ALCISTA_FUERTE': 1.0,
             'TREND_BAJISTA_FUERTE': 1.0,
@@ -541,7 +557,6 @@ class GestorStops:
         if es_reversal:
             rr = rr * 0.9
 
-        # ✅ CORREGIDO: Asegurar mínimo de 1.2
         return max(self.TP_FACTOR_MINIMO, round(rr, 2))
 
     def _obtener_rr_maximo(self, modo: str) -> float:
@@ -557,118 +572,10 @@ class GestorStops:
             'RETEST_FALLBACK': 2.0,
             'SNIPER_ELITE': 4.0,
         }.get(modo, 3.0)
-
         return max(2.0, round(rr, 2))
 
     # ============================================================
-    # UTILIDADES
-    # ============================================================
-
-    def _obtener_sl_minimo_universal(self, simbolo: str, modo: str = 'RETEST') -> float:
-        """
-        Obtiene SL mínimo en pips para CUALQUIER símbolo.
-        V9.47 - CORREGIDO: XAGUSD usa 200 pips.
-        """
-        simbolo_upper = simbolo.upper()
-        
-        # 1. CRIPTO
-        if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
-            base_min = 150
-        # 2. METALES
-        elif 'XAU' in simbolo_upper:
-            base_min = 150
-        elif 'XAG' in simbolo_upper:
-            base_min = 200  # ✅ CORRECTO: 200 pips = 2.00 unidades
-        # 3. ÍNDICES
-        elif any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500', 'SP500']):
-            base_min = 100
-        # 4. FOREX
-        elif 'JPY' in simbolo_upper:
-            base_min = 25
-        elif simbolo_upper in ['EURGBP', 'EURCHF', 'GBPCHF']:
-            base_min = 20
-        else:
-            base_min = 20
-        
-        # ✅ CORREGIDO: Asegurar mínimo absoluto
-        base_min = max(self.SL_MINIMO_ABSOLUTO_PIPS, base_min)
-        
-        return base_min
-
-    def _obtener_sl_maximo_universal(self, simbolo: str, modo: str = 'RETEST') -> float:
-        """
-        Obtiene SL máximo en pips para CUALQUIER símbolo.
-        V9.60 - CORREGIDO DEFINITIVO.
-        """
-        simbolo_upper = simbolo.upper()
-        
-        # ============================================================
-        # 1. CRIPTO
-        # ============================================================
-        if 'BTC' in simbolo_upper:
-            base_max = 300
-        elif 'ETH' in simbolo_upper:
-            base_max = 150
-        elif 'SOL' in simbolo_upper:
-            base_max = 30
-        
-        # ============================================================
-        # 2. METALES
-        # ============================================================
-        elif 'XAU' in simbolo_upper:
-            base_max = 150
-        elif 'XAG' in simbolo_upper:
-            base_max = 100
-        
-        # ============================================================
-        # 3. ÍNDICES
-        # ============================================================
-        elif any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500', 'SP500']):
-            base_max = 300
-        
-        # ============================================================
-        # 4. FOREX
-        # ============================================================
-        elif 'JPY' in simbolo_upper:
-            base_max = 100
-        elif simbolo_upper in ['EURGBP', 'EURCHF', 'GBPCHF']:
-            base_max = 80
-        else:
-            base_max = 60
-        
-        # ✅ Mínimo absoluto: 20 pips
-        return max(20, base_max)
-
-    # ============================================================
-    # LOGGING
-    # ============================================================
-
-    def _log_decision(self,
-                      simbolo: str,
-                      entry: float,
-                      sl: float,
-                      tp: float,
-                      sl_pips: float,
-                      rr: float,
-                      modo: str,
-                      regimen: str,
-                      calidad: str):
-        """Log de la decisión de SL/TP."""
-        digits = self._obtener_digits(simbolo)
-
-        logger.info(
-            f"📊 SL/TP {simbolo} | "
-            f"Entry: {entry:.{digits}f} | "
-            f"SL: {sl:.{digits}f} ({sl_pips:.1f}pips) | "
-            f"TP: {tp:.{digits}f} | "
-            f"R:R: {rr:.2f} | "
-            f"Modo: {modo} | "
-            f"Régimen: {regimen} | "
-            f"Horario: {calidad}"
-        )
-
-    # ============================================================
-    # MÉTODOS DE COMPATIBILIDAD (LEGACY)
+    # MÉTODO PRINCIPAL: validar_sl_tp (CORREGIDO)
     # ============================================================
 
     def validar_sl_tp(self,
@@ -688,22 +595,19 @@ class GestorStops:
                       atr_pips: float = 0.0) -> Tuple[bool, str, float, float, float]:
         """
         Valida y calcula SL/TP optimizado.
-        V9.21 - CORREGIDO DEFINITIVO.
+        V9.22 - CORREGIDO: Considera spread y valor de pip real.
         """
-        # Normalizar dirección
         direccion = direccion.upper().strip()
         if direccion in ['BUY', 'LONG']:
             direccion = 'COMPRA'
         elif direccion in ['SELL', 'SHORT']:
             direccion = 'VENTA'
-        
-        # Validaciones básicas
+
         if sl <= 0:
             return False, "SL inválido", sl, tp, tp2
         if entry_price <= 0:
             return False, "Precio inválido", sl, tp, tp2
-        
-        # Validar dirección SL
+
         if direccion == 'COMPRA':
             if sl >= entry_price:
                 return False, "SL invertido para COMPRA", sl, tp, tp2
@@ -714,38 +618,39 @@ class GestorStops:
                 return False, "SL invertido para VENTA", sl, tp, tp2
             if tp > 0 and tp >= entry_price:
                 return False, "TP inválido para VENTA", sl, tp, tp2
-        
-        # Obtener parámetros
+
         pip_val = self._obtener_pip_val(simbolo, entry_price)
         if pip_val <= 0:
             pip_val = 0.0001
         digits = self._obtener_digits(simbolo)
-        
-        # Obtener SL mínimo y máximo
+
+        # ✅ Obtener spread actual
+        spread_pips = self._obtener_spread_pips(simbolo)
+        if self.modo_backtest:
+            spread_pips = 0.0
+
         sl_min = self._obtener_sl_minimo(simbolo, modo, regimen, calidad_horario, atr_pips)
         sl_max = self._obtener_sl_maximo(simbolo, modo, regimen)
-        
-        # Calcular R:R objetivo
+
         rr_target = self._obtener_rr_objetivo(modo, regimen, es_reversal, en_nivel_clave, calidad_horario)
         rr_min = self._obtener_rr_minimo(modo, regimen, es_reversal)
         rr_max = self._obtener_rr_maximo(modo)
-        
-        # Ajustar SL
+
+        # ✅ Ajustar SL con spread
         sl_ajustado, sl_dist_pips, razon_sl = self._ajustar_sl(
-            entry_price, sl, direccion, sl_min, sl_max, pip_val, digits
+            entry_price, sl, direccion, sl_min, sl_max, pip_val, digits, spread_pips
         )
-        
-        # Validar SL ajustado
+
         if direccion == 'COMPRA':
             if sl_ajustado >= entry_price:
                 return False, "SL ajustado invertido para COMPRA", sl_ajustado, tp, tp2
         else:
             if sl_ajustado <= entry_price:
                 return False, "SL ajustado invertido para VENTA", sl_ajustado, tp, tp2
-        
+
         sl_dist = abs(entry_price - sl_ajustado)
-        
-        # Calcular TP
+
+        # ✅ Calcular TP con spread
         if tp <= 0:
             if direccion == 'COMPRA':
                 tp_calculado = entry_price + (sl_dist * rr_target)
@@ -754,10 +659,9 @@ class GestorStops:
             tp_ajustado = round(tp_calculado, digits)
             rr_actual = rr_target
             razon_tp = f"TP calculado por R:R ({rr_target:.2f})"
-            
-            # ✅ CORRECCIÓN: Asegurar TP mínimo
+
             tp_dist_pips = abs(tp_ajustado - entry_price) / pip_val if pip_val > 0 else 0
-            min_tp_pips = sl_dist_pips * self.TP_FACTOR_MINIMO
+            min_tp_pips = sl_dist_pips * self.TP_FACTOR_MINIMO + spread_pips
             if tp_dist_pips < min_tp_pips:
                 if direccion == 'COMPRA':
                     tp_ajustado = entry_price + (min_tp_pips * pip_val)
@@ -767,135 +671,105 @@ class GestorStops:
                 rr_actual = min_tp_pips / sl_dist_pips if sl_dist_pips > 0 else rr_target
         else:
             tp_ajustado, rr_actual, razon_tp = self._ajustar_tp(
-                entry_price, tp, direccion, sl_dist, rr_target, rr_min, rr_max, pip_val, digits
+                entry_price, tp, direccion, sl_dist, rr_target, rr_min, rr_max, pip_val, digits, spread_pips
             )
-        
-        # Validar TP ajustado
+
         if direccion == 'COMPRA':
             if tp_ajustado <= entry_price:
                 return False, "TP ajustado invertido para COMPRA", sl_ajustado, tp_ajustado, tp2
         else:
             if tp_ajustado >= entry_price:
                 return False, "TP ajustado invertido para VENTA", sl_ajustado, tp_ajustado, tp2
-        
-        # Validaciones finales (V9.21 - CORREGIDO)
-        valido, razon_final = self._validar_final(entry_price, sl_ajustado, tp_ajustado, direccion, digits)
+
+        valido, razon_final = self._validar_final(
+            entry_price, sl_ajustado, tp_ajustado, direccion, digits,
+            spread_pips, simbolo=simbolo
+        )
         if not valido:
             return False, razon_final, sl_ajustado, tp_ajustado, tp2
-        
+
         return True, "OK", sl_ajustado, tp_ajustado, tp2
 
-    def _obtener_pip_val(self, simbolo: str, precio: float = 0.0) -> float:
-        """Obtiene el valor de un pip para el símbolo."""
-        # ✅ 1. Usar módulo unificado (SIEMPRE PRIMERO)
-        try:
-            from utils.parametros_simbolo import get_pip_val
-            return get_pip_val(simbolo, self.mt5 if hasattr(self, 'mt5') else None)
-        except (ImportError, RecursionError):
-            pass
-        
-        # ✅ 2. Fallback CORRECTO
+    def _obtener_sl_minimo_universal(self, simbolo: str, modo: str = 'RETEST') -> float:
+        """Obtiene SL mínimo en pips para CUALQUIER símbolo."""
         simbolo_upper = simbolo.upper()
-        if 'JPY' in simbolo_upper:
-            return 0.01
-        if 'XAU' in simbolo_upper:
-            return 0.10  # ✅ CORREGIDO: 0.10 para oro
-        if 'XAG' in simbolo_upper:
-            return 0.01
-        if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
-            return 1.0
-        if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
-            return 1.0
-        return 0.0001  # ✅ Forex estándar
 
-    def _obtener_digits(self, simbolo: str) -> int:
-        """Obtiene el número de decimales para el símbolo."""
-        # ✅ 1. Usar módulo unificado (SIEMPRE PRIMERO)
-        try:
-            from utils.parametros_simbolo import get_digits
-            return get_digits(simbolo, self.mt5 if hasattr(self, 'mt5') else None)
-        except (ImportError, RecursionError):
-            pass
-        
-        # ✅ 2. Fallback CORRECTO
+        if any(c in simbolo_upper for c in ['BTC', 'ETH', 'SOL']):
+            base_min = 150
+        elif 'XAU' in simbolo_upper:
+            base_min = 150
+        elif 'XAG' in simbolo_upper:
+            base_min = 200
+        elif any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
+            base_min = 100
+        elif 'JPY' in simbolo_upper:
+            base_min = 25
+        elif simbolo_upper in ['EURGBP', 'EURCHF', 'GBPCHF']:
+            base_min = 20
+        else:
+            base_min = 20
+
+        return max(self.SL_MINIMO_ABSOLUTO_PIPS, base_min)
+
+    def _obtener_sl_maximo_universal(self, simbolo: str, modo: str = 'RETEST') -> float:
+        """Obtiene SL máximo en pips para CUALQUIER símbolo."""
         simbolo_upper = simbolo.upper()
-        if 'JPY' in simbolo_upper:
-            return 3
-        if 'XAU' in simbolo_upper:
-            return 2
-        if 'XAG' in simbolo_upper:
-            return 3
-        if any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
-            return 1
+
         if 'BTC' in simbolo_upper:
-            return 2
-        if 'ETH' in simbolo_upper:
-            return 2
-        if 'SOL' in simbolo_upper:
-            return 2
-        return 5  # ✅ CORREGIDO: 5 para Forex estándar
+            base_max = 300
+        elif 'ETH' in simbolo_upper:
+            base_max = 150
+        elif 'SOL' in simbolo_upper:
+            base_max = 30
+        elif 'XAU' in simbolo_upper:
+            base_max = 150
+        elif 'XAG' in simbolo_upper:
+            base_max = 100
+        elif any(x in simbolo_upper for x in ['US30', 'NAS100', 'US500']):
+            base_max = 300
+        elif 'JPY' in simbolo_upper:
+            base_max = 100
+        elif simbolo_upper in ['EURGBP', 'EURCHF', 'GBPCHF']:
+            base_max = 80
+        else:
+            base_max = 60
+
+        return max(20, base_max)
+
+    def _log_decision(self,
+                      simbolo: str,
+                      entry: float,
+                      sl: float,
+                      tp: float,
+                      sl_pips: float,
+                      rr: float,
+                      modo: str,
+                      regimen: str,
+                      calidad: str):
+        """Log de la decisión de SL/TP."""
+        digits = self._obtener_digits(simbolo)
+        logger.info(
+            f"📊 SL/TP {simbolo} | "
+            f"Entry: {entry:.{digits}f} | "
+            f"SL: {sl:.{digits}f} ({sl_pips:.1f}pips) | "
+            f"TP: {tp:.{digits}f} | "
+            f"R:R: {rr:.2f} | "
+            f"Modo: {modo} | "
+            f"Régimen: {regimen} | "
+            f"Horario: {calidad}"
+        )
+
 
 # ============================================================
 # FUNCIÓN DE UTILIDAD
 # ============================================================
 
 def create_gestor_stops(config: Optional[Any] = None,
-                        modo_backtest: bool = False) -> GestorStops:
+                        modo_backtest: bool = False,
+                        mt5: Optional[Any] = None) -> GestorStops:
     """Crea una instancia de GestorStops."""
     return GestorStops(
         config=config,
-        modo_backtest=modo_backtest
+        modo_backtest=modo_backtest,
+        mt5=mt5
     )
-
-
-# ============================================================
-# TEST
-# ============================================================
-
-if __name__ == "__main__":
-    # Prueba rápida
-    gestor = GestorStops(modo_backtest=True)
-
-    # Test 1: RETEST en EURUSD
-    valido, razon, sl, tp, tp2 = gestor.validar_sl_tp(
-        simbolo='EURUSD',
-        entry_price=1.10000,
-        sl=1.09850,
-        tp=0,  # TP=0 para cálculo automático
-        direccion='COMPRA',
-        modo='RETEST',
-        regimen='TREND_ALCISTA_FUERTE',
-        calidad_horario='EXCELENTE'
-    )
-    print(f"Test 1 - EURUSD RETEST: {valido} - {razon}")
-    print(f"  SL: {sl:.5f}, TP: {tp:.5f}, TP2: {tp2:.5f}")
-
-    # Test 2: SNIPER_ELITE en XAUUSD
-    valido, razon, sl, tp, tp2 = gestor.validar_sl_tp(
-        simbolo='XAUUSD',
-        entry_price=2000.00,
-        sl=1990.00,
-        tp=0,  # TP=0 para cálculo automático
-        direccion='COMPRA',
-        modo='SNIPER_ELITE',
-        regimen='RANGO_APRETADO',
-        calidad_horario='REGULAR'
-    )
-    print(f"\nTest 2 - XAUUSD SNIPER_ELITE: {valido} - {razon}")
-    print(f"  SL: {sl:.2f}, TP: {tp:.2f}, TP2: {tp2:.2f}")
-
-    # Test 3: BREAKOUT en US30
-    valido, razon, sl, tp, tp2 = gestor.validar_sl_tp(
-        simbolo='US30',
-        entry_price=40000.00,
-        sl=39900.00,
-        tp=0,  # TP=0 para cálculo automático
-        direccion='COMPRA',
-        modo='BREAKOUT',
-        regimen='BREAKOUT_INMINENTE',
-        calidad_horario='BUENA'
-    )
-    print(f"\nTest 3 - US30 BREAKOUT: {valido} - {razon}")
-    print(f"  SL: {sl:.2f}, TP: {tp:.2f}, TP2: {tp2:.2f}")
-
-    print("\n✅ Prueba completada")
